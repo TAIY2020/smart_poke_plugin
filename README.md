@@ -1,0 +1,1 @@
+# smart_poke_plugin
