@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "version": "1.1.0",
+  "name": "智能戳一戳插件 | Smart Poke Plugin",
+  "description": "拟人化 QQ 戳一戳响应插件：被戳时根据人设、上下文和概率，自然地回戳、文字调侃、发表情或选择性沉默。支持暴戳检测、冷却限频与黑白名单。",
+  "author": {
+    "name": "TaiYang",
+    "url": "https://github.com/TAIY2020"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/TAIY2020/smart_poke_plugin",
+    "homepage": "https://github.com/TAIY2020/smart_poke_plugin",
+    "documentation": "https://github.com/TAIY2020/smart_poke_plugin",
+    "issues": "https://github.com/TAIY2020/smart_poke_plugin/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "send.emoji",
+    "api.call",
+    "emoji.get_random",
+    "emoji.get_by_description",
+    "chat.get_stream_by_group_id",
+    "chat.get_stream_by_user_id",
+    "config.get"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "TAIY2020.smart_poke_plugin"
+}
