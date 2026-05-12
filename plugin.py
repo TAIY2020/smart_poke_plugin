@@ -110,7 +110,7 @@ class ReactionSection(PluginConfigBase):
         json_schema_extra={"label": "表情权重"},
     )
     silent_chat_probability: float = Field(
-        default=0.3,
+        default=0.1,
         ge=0.0,
         le=1.0,
         description=(
@@ -119,7 +119,7 @@ class ReactionSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "沉默时发言概率",
-            "hint": "未命中反应概率时，挤一句 fallback.silent_replies 的概率（会消耗冷却）",
+            "hint": "未命中反应概率时，挤一句 silent_replies 的概率（会消耗冷却）",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -127,7 +127,7 @@ class ReactionSection(PluginConfigBase):
         },
     )
     text_weight: float = Field(
-        default=0.3,
+        default=0.2,
         ge=0.0,
         le=1.0,
         description="反应时选择文字回复的权重；三种权重按总和归一化，不要求加起来等于 1",
@@ -142,7 +142,7 @@ class ReactionSection(PluginConfigBase):
         json_schema_extra={"label": "最小延迟（秒）"},
     )
     max_delay_seconds: float = Field(
-        default=3.5,
+        default=2.5,
         ge=0.0,
         le=60.0,
         description="作出反应的最大延迟（秒）",
@@ -165,7 +165,7 @@ class ReactionSection(PluginConfigBase):
         json_schema_extra={"label": "暴戳阈值"},
     )
     spam_window_seconds: int = Field(
-        default=30,
+        default=45,
         ge=5,
         le=600,
         description="暴戳判定窗口长度（秒）",
@@ -193,7 +193,6 @@ class FallbackSection(PluginConfigBase):
         default_factory=lambda: [
             "干嘛戳我",
             "诶诶诶，戳什么戳",
-            "？？？",
             "干啥",
         ],
         description="普通情况下的文字回复随机池",
@@ -214,8 +213,8 @@ class FallbackSection(PluginConfigBase):
     silent_replies: List[str] = Field(
         default_factory=lambda: [
             "...",
-            "地铁老人手机.jpg",
-            "懒得理",
+            "？？？",
+            "，，，",
         ],
         description="选择「沉默」反应时偶尔会发出的极简内容",
         json_schema_extra={"label": "沉默回复池"},
@@ -289,6 +288,7 @@ class BystanderSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "目标策略",
+            "hint": "victim：戳被戳者（跟着欺负他）| poker：戳发起者（替被戳者还击）| random：随机选一个",
             "x-widget": "select",
             "options": [
                 {"value": "victim", "label": "戳被戳者"},
