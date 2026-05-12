@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
@@ -28,7 +30,20 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from pydantic import field_validator
 
 
-PLUGIN_VERSION = "1.1.0"
+def _load_manifest_version() -> str:
+    """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
+    try:
+        manifest_path = Path(__file__).parent / "_manifest.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version = data.get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+PLUGIN_VERSION = _load_manifest_version()
 
 
 # --- 配置模型 ---
@@ -100,10 +115,11 @@ class ReactionSection(PluginConfigBase):
         le=1.0,
         description=(
             "react_probability 未命中时仍然挤一句 silent_replies 的概率。"
-            "意义上等价于「装看不见但偶尔抱怨一下」"
+            "意义上等价于「装看不见但偶尔抱怨一下」；命中后会消耗冷却，避免短时间内反复挤话"
         ),
         json_schema_extra={
             "label": "沉默时发言概率",
+            "hint": "未命中反应概率时，挤一句 fallback.silent_replies 的概率（会消耗冷却）",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -339,9 +355,8 @@ class PokeContext:
         "target_id",
         "target_name",
         "group_id",
-        "group_name",
         "stream_id",
-        "raw_payload",
+        "cooldown_key",
     )
 
     def __init__(self) -> None:
@@ -354,18 +369,20 @@ class PokeContext:
         self.target_id: str = ""
         self.target_name: str = ""
         self.group_id: str = ""
-        self.group_name: str = ""
         self.stream_id: str = ""
-        self.raw_payload: Dict[str, Any] = {}
+        # napcat 注入的 notice 消息 session_id 常为空，需要按 stream_id → group_id → poker_id 回退
+        self.cooldown_key: str = ""
 
 
 class PokeStateManager:
     """每个插件实例独立持有的状态：冷却时间戳与每用户戳次数窗口。
 
     设计要点：
-    - 戳麦麦冷却按 ``stream_id:poker_id`` 维度计：不同人独立冷却，A 触发冷却不阻挡 B。
-    - 跟风戳冷却按 ``stream_id`` 维度计：避免麦麦在群里跟风刷屏。
-    - 暴戳计数同样按 ``stream_id:poker_id`` 维度，与戳麦麦冷却一致。
+    - 戳麦麦冷却按 ``scope_key:poker_id`` 维度计：不同人独立冷却，A 触发冷却不阻挡 B。
+    - 跟风戳冷却按 ``scope_key`` 维度计：避免麦麦在群里跟风刷屏。
+    - 暴戳计数同样按 ``scope_key:poker_id`` 维度，与戳麦麦冷却一致。
+    - ``scope_key`` 由调用方决定（stream_id → group_id → poker_id 回退），
+      避免 napcat 注入的 notice 消息 session_id 为空时冷却完全失效。
     - 字典 key 不会自动消失，因此在 record_poke_and_count 中按计数触发 _prune。
     """
 
@@ -379,38 +396,40 @@ class PokeStateManager:
         self._record_counter: int = 0
 
     @staticmethod
-    def _cooldown_key(stream_id: str, poker_id: str) -> str:
-        if not stream_id:
+    def _cooldown_key(scope_key: str, poker_id: str) -> str:
+        if not scope_key:
             return ""
-        return f"{stream_id}:{poker_id}" if poker_id else stream_id
+        return f"{scope_key}:{poker_id}" if poker_id else scope_key
 
-    def in_cooldown(self, stream_id: str, poker_id: str, cooldown_seconds: int) -> bool:
-        if cooldown_seconds <= 0 or not stream_id:
+    def in_cooldown(self, scope_key: str, poker_id: str, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0 or not scope_key:
             return False
-        key = self._cooldown_key(stream_id, poker_id)
+        key = self._cooldown_key(scope_key, poker_id)
         last = self._last_react_at.get(key, 0.0)
         return (time.time() - last) < cooldown_seconds
 
-    def mark_reacted(self, stream_id: str, poker_id: str) -> None:
-        key = self._cooldown_key(stream_id, poker_id)
+    def mark_reacted(self, scope_key: str, poker_id: str) -> None:
+        key = self._cooldown_key(scope_key, poker_id)
         if key:
             self._last_react_at[key] = time.time()
 
-    def in_bystander_cooldown(self, stream_id: str, cooldown_seconds: int) -> bool:
-        if cooldown_seconds <= 0 or not stream_id:
+    def in_bystander_cooldown(self, scope_key: str, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0 or not scope_key:
             return False
-        last = self._last_bystander_at.get(stream_id, 0.0)
+        last = self._last_bystander_at.get(scope_key, 0.0)
         return (time.time() - last) < cooldown_seconds
 
-    def mark_bystander(self, stream_id: str) -> None:
-        if stream_id:
-            self._last_bystander_at[stream_id] = time.time()
+    def mark_bystander(self, scope_key: str) -> None:
+        if scope_key:
+            self._last_bystander_at[scope_key] = time.time()
 
     def record_poke_and_count(
-        self, stream_id: str, poker_id: str, window_seconds: int
+        self, scope_key: str, poker_id: str, window_seconds: int
     ) -> int:
         """记录一次戳，返回窗口期内的累计次数。"""
-        key = f"{stream_id}:{poker_id}"
+        if not scope_key:
+            return 0
+        key = f"{scope_key}:{poker_id}" if poker_id else scope_key
         now = time.time()
         cutoff = now - max(window_seconds, 1)
         records = [t for t in self._poke_records[key] if t >= cutoff]
@@ -487,10 +506,12 @@ class SmartPokePlugin(MaiBotPlugin):
         self._spawn_background_task(self._check_emoji_emotions(), "emoji_emotion_check")
 
     async def on_unload(self) -> None:
-        # 取消未完成的反应任务，避免 Runner 卸载后还在调用 capability
-        for task in list(self._pending_tasks):
-            if not task.done():
-                task.cancel()
+        # 取消未完成的反应任务并等待真正终止，避免 Runner 卸载后还在调用 capability
+        to_cancel = [t for t in self._pending_tasks if not t.done()]
+        for task in to_cancel:
+            task.cancel()
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
         self._pending_tasks.clear()
         self._state.clear()
 
@@ -531,7 +552,9 @@ class SmartPokePlugin(MaiBotPlugin):
 
         若完全不交集，说明按关键词搜表情会一直失败，应当提示用户调整 keywords
         或允许随机回退。SDK 已自动解包 emoji.get_emotions，直接返回 emotion 字符串列表。
+        启动后稍等数秒再查，避免表情库尚未装载完成时误报。
         """
+        await asyncio.sleep(5.0)
         try:
             emotions = await self.ctx.emoji.get_emotions()
             if not isinstance(emotions, list):
@@ -614,32 +637,36 @@ class SmartPokePlugin(MaiBotPlugin):
         # 暴戳计数：通过黑名单/场景检查后立即累计，与是否反应解耦，
         # 否则连续戳但概率没命中时永远进不了「被烦」状态。
         poke_count = self._state.record_poke_and_count(
-            ctx.stream_id or ctx.group_id or ctx.poker_id,
+            ctx.cooldown_key,
             ctx.poker_id,
             self.config.reaction.spam_window_seconds,
         )
         is_spam = poke_count >= self.config.reaction.spam_threshold
 
-        # 冷却（按 stream_id+poker_id 维度：不同人独立冷却）
+        # 冷却（按 cooldown_key + poker_id 维度：不同人独立冷却）
         if self._state.in_cooldown(
-            ctx.stream_id, ctx.poker_id, self.config.reaction.cooldown_seconds
+            ctx.cooldown_key, ctx.poker_id, self.config.reaction.cooldown_seconds
         ):
             self.ctx.logger.debug(
                 "[%s:%s] 戳一戳冷却中，已拦截",
-                ctx.stream_id or ctx.group_id, ctx.poker_id,
+                ctx.cooldown_key, ctx.poker_id,
             )
             return {"action": "abort"}
 
         # 反应概率
         if random.random() > self.config.reaction.react_probability:
-            self.ctx.logger.debug("[%s] 戳一戳触发概率未命中，静默拦截", ctx.stream_id or ctx.poker_id)
+            self.ctx.logger.debug(
+                "[%s] 戳一戳触发概率未命中，静默拦截", ctx.cooldown_key or ctx.poker_id
+            )
             # 未命中也按 silent_chat_probability 概率偶尔挤一句 silent_replies
             chat_prob = self.config.reaction.silent_chat_probability
             if chat_prob > 0 and random.random() < chat_prob:
+                # silent_reply 也消耗冷却，避免短时间内被同一人连戳时反复挤话
+                self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
                 self._spawn_background_task(self._silent_reply(ctx), "silent_reply")
             return {"action": "abort"}
 
-        self._state.mark_reacted(ctx.stream_id, ctx.poker_id)
+        self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
 
         # 异步执行反应（避免阻塞 Hook 链）
         self._spawn_background_task(
@@ -663,8 +690,8 @@ class SmartPokePlugin(MaiBotPlugin):
         # 戳的人或被戳的人是麦麦自己：交给主分支处理
         if ctx.poker_id == ctx.self_id or ctx.target_id == ctx.self_id:
             return
-        # 冷却
-        bystander_key = ctx.stream_id or ctx.group_id
+        # 冷却：按 cooldown_key 维度（群聊场景下回退到 group_id）
+        bystander_key = ctx.cooldown_key
         if self._state.in_bystander_cooldown(bystander_key, cfg.cooldown_seconds):
             return
         # 概率
@@ -700,47 +727,30 @@ class SmartPokePlugin(MaiBotPlugin):
 
     async def _react_bystander(self, ctx: PokeContext, target_id: str) -> None:
         """跟风戳：延迟后给指定目标戳一下，纯戳不发文字。"""
-        try:
-            cfg = self.config.bystander
-            lo = max(0.0, cfg.min_delay_seconds)
-            hi = max(lo, cfg.max_delay_seconds)
-            delay = random.uniform(lo, hi) if hi > 0 else 0
-            if delay > 0:
-                await asyncio.sleep(delay)
+        cfg = self.config.bystander
+        lo = max(0.0, cfg.min_delay_seconds)
+        hi = max(lo, cfg.max_delay_seconds)
+        delay = random.uniform(lo, hi) if hi > 0 else 0
+        if delay > 0:
+            await asyncio.sleep(delay)
 
-            target_int = _to_positive_int(target_id)
-            if target_int is None:
-                return
-            call_kwargs: Dict[str, Any] = {"user_id": target_int}
-            if ctx.is_group:
-                group_int = _to_positive_int(ctx.group_id)
-                if group_int is None:
-                    return
-                call_kwargs["group_id"] = group_int
-
-            try:
-                resp = await self.ctx.api.call(
-                    "adapter.napcat.message.send_poke", **call_kwargs
-                )
-                if isinstance(resp, dict) and resp.get("success") is False:
-                    self.ctx.logger.warning("跟风戳调用失败: %s", resp.get("error"))
-                    return
-                self.ctx.logger.info(
-                    "[smart_poke] 跟风戳完成: strategy=%s, target=%s (poker=%s, victim=%s)",
-                    self.config.bystander.target_strategy,
-                    target_id, ctx.poker_id, ctx.target_id,
-                )
-            except Exception:
-                self.ctx.logger.exception("跟风戳调用异常")
-        except Exception:
-            self.ctx.logger.exception("跟风戳任务异常")
+        ok = await self._invoke_send_poke(
+            target_id, ctx.group_id, is_group=ctx.is_group, label="bystander"
+        )
+        if ok:
+            self.ctx.logger.info(
+                "[smart_poke] 跟风戳完成: strategy=%s, target=%s (poker=%s, victim=%s)",
+                cfg.target_strategy,
+                target_id, ctx.poker_id, ctx.target_id,
+            )
 
     # ===== 反应主流程 =====
 
     async def _silent_reply(self, ctx: PokeContext) -> None:
         """react_probability 未命中时按 silent_chat_probability 概率挤出的一句轻反应。
 
-        和 _react 不同：不消耗冷却、不参与反应类型抽样，只挑一句 silent_replies。
+        触发前已由 handle_poke_event 调用 mark_reacted 消耗冷却，避免短时间内被同一人
+        连戳时反复挤话。与正常反应分支不同：不参与反应类型抽样，只挑一句 silent_replies。
         """
         try:
             await self._delay_a_bit()
@@ -766,11 +776,15 @@ class SmartPokePlugin(MaiBotPlugin):
             stream_id = await self._resolve_stream_id(ctx)
             if not stream_id:
                 self.ctx.logger.debug(
-                    "[smart_poke] 无法解析 stream_id (group=%s, poker=%s)，文字/表情将跳过",
+                    "[smart_poke] 无法解析 stream_id (group=%s, poker=%s)，回退到回戳路径",
                     ctx.group_id, ctx.poker_id,
                 )
 
             kind = self._decide_reaction_kind(is_spam)
+            # 没有 stream_id 时，文字/表情类型无法发出，统一回落到回戳
+            if kind in ("emoji", "text") and not stream_id:
+                kind = "poke"
+
             self.ctx.logger.info(
                 "[smart_poke] 触发反应: kind=%s, is_spam=%s, poke_count=%d, poker=%s, scene=%s",
                 kind,
@@ -788,22 +802,19 @@ class SmartPokePlugin(MaiBotPlugin):
                 return
 
             if kind == "emoji":
-                ok = await self._send_emoji(stream_id) if stream_id else False
+                ok = await self._send_emoji(stream_id)
                 if ok:
                     return
-                # 表情发送失败 / 没有 stream_id → 回退到回戳
+                # 表情发送失败 → 回退到回戳
                 self.ctx.logger.debug("表情反应失败，回退到回戳")
                 ok_poke = await self._send_back_poke(ctx)
-                if not ok_poke and stream_id:
+                if not ok_poke:
                     # 回戳也失败再退到文字
                     await self._send_text(stream_id, is_spam)
                 return
 
-            # 默认：文字。没有 stream_id 时退一步用回戳兜底，避免完全没反应
-            if stream_id:
-                await self._send_text(stream_id, is_spam)
-            else:
-                await self._send_back_poke(ctx)
+            # kind == "text"
+            await self._send_text(stream_id, is_spam)
         except Exception:
             self.ctx.logger.exception("反应戳一戳时出错")
 
@@ -825,10 +836,12 @@ class SmartPokePlugin(MaiBotPlugin):
         与本方法的反应类型抽样无关。
         """
         cfg = self.config.reaction
+        spam_mult_poke = 0.5 if is_spam else 1.0
+        spam_mult_emoji = 1.0
         spam_mult_text = 1.5 if is_spam else 1.0
         weights = {
-            "poke": max(0.0, cfg.back_poke_weight * (0.5 if is_spam else 1.0)),
-            "emoji": max(0.0, cfg.emoji_weight),
+            "poke": max(0.0, cfg.back_poke_weight * spam_mult_poke),
+            "emoji": max(0.0, cfg.emoji_weight * spam_mult_emoji),
             "text": max(0.0, cfg.text_weight * spam_mult_text),
         }
         total = sum(weights.values())
@@ -845,35 +858,53 @@ class SmartPokePlugin(MaiBotPlugin):
 
     # ===== 反应实现 =====
 
-    async def _send_back_poke(self, ctx: PokeContext) -> bool:
-        """通过 NapCat 适配器发送回戳，返回是否成功。
+    async def _invoke_send_poke(
+        self,
+        target_id: str,
+        group_id: str,
+        *,
+        is_group: bool,
+        label: str,
+    ) -> bool:
+        """统一封装 adapter.napcat.message.send_poke 调用。
 
-        群聊和私聊统一调用 ``adapter.napcat.message.send_poke``：
-        - 群聊：同时传 ``user_id``（被戳者）和 ``group_id``。
-        - 私聊：仅传 ``user_id``，省略 ``group_id``。
+        - 私聊：仅传 ``user_id``。
+        - 群聊：同时传 ``user_id`` / ``group_id`` / ``target_id``（按 NapCat 隐藏 schema
+          要求），其中 ``target_id`` 与 ``user_id`` 同值，明确指向被戳对象。
+
+        返回 True 表示调用成功（NapCat 已接受请求）。
         """
-        poker_int = _to_positive_int(ctx.poker_id)
-        if poker_int is None:
+        target_int = _to_positive_int(target_id)
+        if target_int is None:
             return False
 
-        call_kwargs: Dict[str, Any] = {"user_id": poker_int}
-        if ctx.is_group:
-            group_int = _to_positive_int(ctx.group_id)
+        call_kwargs: Dict[str, Any] = {"user_id": target_int}
+        if is_group:
+            group_int = _to_positive_int(group_id)
             if group_int is None:
                 return False
             call_kwargs["group_id"] = group_int
+            call_kwargs["target_id"] = target_int
 
         try:
             resp = await self.ctx.api.call(
                 "adapter.napcat.message.send_poke", **call_kwargs
             )
             if isinstance(resp, dict) and resp.get("success") is False:
-                self.ctx.logger.warning("回戳调用失败: %s", resp.get("error"))
+                self.ctx.logger.warning(
+                    "[%s] send_poke 调用失败: %s", label, resp.get("error")
+                )
                 return False
             return True
         except Exception:
-            self.ctx.logger.exception("发送回戳异常")
+            self.ctx.logger.exception("[%s] send_poke 调用异常", label)
             return False
+
+    async def _send_back_poke(self, ctx: PokeContext) -> bool:
+        """通过 NapCat 适配器发送回戳，返回是否成功。"""
+        return await self._invoke_send_poke(
+            ctx.poker_id, ctx.group_id, is_group=ctx.is_group, label="back_poke"
+        )
 
     async def _send_text(self, stream_id: str, is_spam: bool) -> None:
         """从配置的回复池中随机挑一句文字发出。"""
@@ -979,13 +1010,18 @@ class SmartPokePlugin(MaiBotPlugin):
         self_id = str(payload.get("self_id") or additional.get("self_id") or "").strip()
         poker_id = str(payload.get("user_id") or "").strip()
         target_id = str(payload.get("target_id") or "").strip()
-        group_id = str(payload.get("group_id") or "").strip()
 
         if not self_id or not poker_id or not target_id:
             return ctx
 
-        user_info = msg_info.get("user_info") or {}
+        # 严格判定 group_id：必须是正整数才视为群聊，避免 "0" / 0 等被误判
         group_info = msg_info.get("group_info") or {}
+        raw_group_id = payload.get("group_id")
+        if raw_group_id is None or str(raw_group_id).strip() in ("", "0"):
+            raw_group_id = group_info.get("group_id")
+        group_int = _to_positive_int(raw_group_id)
+
+        user_info = msg_info.get("user_info") or {}
 
         ctx.is_valid = True
         ctx.is_poking_bot = target_id == self_id
@@ -997,11 +1033,12 @@ class SmartPokePlugin(MaiBotPlugin):
         # 后续如有需要可以通过 ctx.api.call("adapter.napcat.group.get_group_member_info") 查询，
         # 但戳一戳本身不需要昵称，这里留空即可。
         ctx.target_name = ""
-        ctx.group_id = group_id or str(group_info.get("group_id") or "")
-        ctx.group_name = str(group_info.get("group_name") or "")
-        ctx.is_group = bool(ctx.group_id)
+        ctx.group_id = str(group_int) if group_int is not None else ""
+        ctx.is_group = group_int is not None
         ctx.stream_id = str(message.get("session_id") or "")
-        ctx.raw_payload = payload
+        # 冷却 key fallback：napcat notice 注入的 session_id 常为空，
+        # 必须按 stream_id → group_id → poker_id 回退才能保证冷却生效。
+        ctx.cooldown_key = ctx.stream_id or ctx.group_id or ctx.poker_id
         return ctx
 
     async def _resolve_stream_id(self, ctx: PokeContext) -> str:

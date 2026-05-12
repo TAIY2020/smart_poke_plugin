@@ -4,7 +4,7 @@
 
 被戳时，麦麦不会千篇一律地复读「XX 戳了我一下」，而是按可配置的概率随机选择回戳、文字调侃、发表情包或保持沉默；并且当群里其他人互戳时，麦麦还会有一定概率「跟风」也戳一下，制造群聊乐子。
 
-> 本版本 (v1.1.0) 基于 **MaiBot SDK v2** 开发，使用 `@HookHandler` 装饰器订阅 `chat.receive.before_process` 钩子，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本 (v1.2.0) 基于 **MaiBot SDK v2** 开发，使用 `@HookHandler` 装饰器订阅 `chat.receive.before_process` 钩子，配合 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -13,7 +13,7 @@
 - **跟风戳**: 当群里别人互戳时，麦麦会按概率「跟风」也戳一下，目标可选「跟着欺负被戳者」「替被戳者还击发起者」或「两者随机」。
 - **暴戳检测**: 被同一人在判定窗口内多次戳后切换到「被烦」回复池，语气会更冲；计数与是否反应解耦，连续戳即使没命中概率也会累积。
 - **思考延迟**: 反应前有随机延迟，避免机器人秒回的违和感。
-- **冷却限频**: 戳麦麦冷却按 `stream_id + poker_id` 维度计（不同人独立冷却），跟风戳冷却按 `stream_id` 维度计（避免群刷屏）。
+- **冷却限频**: 戳麦麦冷却按 `cooldown_key + poker_id` 维度计（不同人独立冷却），跟风戳冷却按 `cooldown_key` 维度计（避免群刷屏）。`cooldown_key` 按 `stream_id → group_id → poker_id` 回退，保证 napcat 注入的 notice 消息（session_id 常为空）也能正常受冷却约束。silent_reply 同样消耗冷却，避免短时间内被同一人连戳时反复挤话。
 - **黑名单**: 被列入黑名单的用户戳麦麦本人时事件会被静默拦截；跟风戳场景下仅当跟风目标命中黑名单才跳过。
 - **场景开关**: 群聊响应、私聊响应、跟风仅群聊均可独立配置；关闭对应场景时戳事件会照常传给主程序，不会被插件吞掉。
 - **后台任务限时**: 反应任务带 60 秒超时兜底，避免外部 RPC 异常拖死协程。
@@ -43,8 +43,8 @@
 ```toml
 [plugin]
 name = "smart_poke_plugin"
-version = "1.1.0"
-config_version = "1.1.0"
+version = "1.2.0"
+config_version = "1.2.0"
 enabled = true
 
 [reaction]
@@ -88,7 +88,7 @@ max_delay_seconds = 4.0
 
 - **`user_control.blacklist`**: 黑名单 QQ 列表（字符串格式）。被列入此名单的用户**戳麦麦本人时**事件会被静默拦截；他们发起的别人互戳事件仍可能触发跟风戳，但跟风目标若命中黑名单依然会被跳过。例如：`blacklist = ["12345", "67890"]`。
 - **`user_control.ignore_self_poke`**: 是否忽略麦麦戳自己的事件（避免回声）。默认 `true`。
-- **`reaction.cooldown_seconds` / `bystander.cooldown_seconds`**: 两个冷却独立计时。前者按 `stream_id + poker_id` 维度，后者按 `stream_id` 维度。
+- **`reaction.cooldown_seconds` / `bystander.cooldown_seconds`**: 两个冷却独立计时。前者按 `cooldown_key + poker_id` 维度，后者按 `cooldown_key` 维度。`cooldown_key` 按 `stream_id → group_id → poker_id` 自动回退。
 
 ---
 
@@ -99,7 +99,7 @@ max_delay_seconds = 4.0
 1. 命中黑名单/命中冷却：**静默拦截**事件，麦麦没动作。
 2. 关闭对应场景开关（`react_in_group=false` 或 `react_in_private=false`）：**事件照常放行**，让主程序后续流程自行处理。
 3. 通过以上检查后立即累计一次暴戳计数（与"是否反应"解耦）。
-4. `react_probability` 未命中：拦截事件，但仍有 `silent_chat_probability` 概率挤出一句 `fallback.silent_replies` 池中的极简内容（"装看不见但还是嘀咕了一句"）。
+4. `react_probability` 未命中：拦截事件，但仍有 `silent_chat_probability` 概率挤出一句 `fallback.silent_replies` 池中的极简内容（"装看不见但还是嘀咕了一句"）；命中后会消耗冷却，避免短时间内被同一人连戳时反复挤话。
 5. `react_probability` 命中：按权重抽一种反应执行：
    - **回戳**：调用 NapCat 适配器戳回去（群聊带 `group_id`，私聊省略）。失败时回退到文字。
    - **文字调侃**：从 `fallback.normal_replies` 池中随机挑一句发出去；进入暴戳状态时改从 `fallback.spam_replies` 池中挑。
@@ -137,9 +137,9 @@ max_delay_seconds = 4.0
 | `reaction.back_poke_weight` | float | `0.4` | 反应抽样里「回戳」的权重 |
 | `reaction.emoji_weight` | float | `0.3` | 反应抽样里「表情包」的权重 |
 | `reaction.text_weight` | float | `0.3` | 反应抽样里「文字」的权重（三个权重独立配置，按总和归一化） |
-| `reaction.silent_chat_probability` | float | `0.3` | `react_probability` 未命中时，仍然挤出一句 `silent_replies` 的概率 |
+| `reaction.silent_chat_probability` | float | `0.3` | `react_probability` 未命中时，仍然挤出一句 `silent_replies` 的概率；命中会消耗冷却 |
 | `reaction.min_delay_seconds` / `max_delay_seconds` | float | `1.0` / `3.5` | 反应前的随机延迟范围（秒） |
-| `reaction.cooldown_seconds` | int | `8` | 戳麦麦本人的反应冷却时长（秒），按 `stream_id + poker_id` 维度计 |
+| `reaction.cooldown_seconds` | int | `8` | 戳麦麦本人的反应冷却时长（秒），按 `cooldown_key + poker_id` 维度计 |
 | `reaction.spam_threshold` | int | `3` | 暴戳判定阈值 |
 | `reaction.spam_window_seconds` | int | `30` | 暴戳判定窗口长度（秒） |
 | `reaction.react_in_group` / `react_in_private` | bool | `true` / `true` | 群聊 / 私聊响应开关；关闭后事件 `return None` 放行 |
@@ -153,14 +153,14 @@ max_delay_seconds = 4.0
 | `bystander.enabled` | bool | `true` | 是否启用跟风戳 |
 | `bystander.probability` | float | `0.85` | 别人互戳时跟风戳的触发概率 |
 | `bystander.target_strategy` | str | `"victim"` | 跟风目标：`victim` / `poker` / `random` |
-| `bystander.cooldown_seconds` | int | `30` | 跟风戳冷却（独立于戳麦麦的冷却，按 `stream_id` 维度） |
+| `bystander.cooldown_seconds` | int | `30` | 跟风戳冷却（独立于戳麦麦的冷却，按 `cooldown_key` 维度） |
 | `bystander.min_delay_seconds` / `max_delay_seconds` | float | `1.5` / `4.0` | 跟风戳延迟范围（秒） |
 
 ---
 
 ## 📝 注意事项
 
-- **冷却维度**: 戳麦麦本人冷却按 `stream_id + poker_id` 维度计——A 触发冷却不会阻挡 B 同时段戳麦麦；跟风戳冷却按 `stream_id` 维度计，避免在同一群里跟风刷屏。
+- **冷却维度**: 戳麦麦本人冷却按 `cooldown_key + poker_id` 维度计——A 触发冷却不会阻挡 B 同时段戳麦麦；跟风戳冷却按 `cooldown_key` 维度计，避免在同一群里跟风刷屏。`cooldown_key` 按 `stream_id → group_id → poker_id` 回退，保证 napcat 注入的 notice 消息（session_id 常为空）也能正常受冷却约束。
 - **状态隔离**: `PokeStateManager` 作为插件实例属性持有，热重载后状态会被重建，不会跨实例残留。
 - **表情按 emotion 标签命中即用**: Host 的 `emoji.get_by_description` 底层是 emotion 标签模糊匹配，命中后直接返回单张表情，不向调用方暴露相似度数值。启动时插件会调用 `emoji.get_emotions` 与配置关键词求交集，无交集时 warn 提示。
 
