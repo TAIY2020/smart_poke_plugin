@@ -501,7 +501,7 @@ class SmartPokePlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._refresh_user_sets()
-        self.ctx.logger.info("智能戳一戳插件 v%s 已就绪。", PLUGIN_VERSION)
+        self.ctx.logger.info("智能戳一戳插件(v%s)初始化完成。", PLUGIN_VERSION)
         # 探测一次表情库的 emotion 标签，提示用户关键词命中情况
         self._spawn_background_task(self._check_emoji_emotions(), "emoji_emotion_check")
 
