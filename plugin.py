@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 import time
 from collections import defaultdict
@@ -28,8 +27,6 @@ from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from pydantic import field_validator
 
-
-logger = logging.getLogger("plugin.smart_poke")
 
 PLUGIN_VERSION = "1.1.0"
 
@@ -83,33 +80,42 @@ class ReactionSection(PluginConfigBase):
             "step": 0.05,
         },
     )
-    back_poke_probability: float = Field(
-        default=0.45,
+    back_poke_weight: float = Field(
+        default=0.4,
         ge=0.0,
         le=1.0,
-        description="反应时选择回戳的占比（与表情、文字、沉默互斥分配）",
-        json_schema_extra={"label": "回戳占比"},
+        description="反应时选择回戳的权重（与表情、文字按总和归一化分配）",
+        json_schema_extra={"label": "回戳权重"},
     )
-    emoji_probability: float = Field(
+    emoji_weight: float = Field(
         default=0.3,
         ge=0.0,
         le=1.0,
-        description="反应时选择发表情包的占比",
-        json_schema_extra={"label": "表情占比"},
+        description="反应时选择发表情包的权重",
+        json_schema_extra={"label": "表情权重"},
     )
-    silent_probability: float = Field(
-        default=0.05,
+    silent_chat_probability: float = Field(
+        default=0.3,
         ge=0.0,
         le=1.0,
-        description="反应时选择沉默的占比",
-        json_schema_extra={"label": "沉默占比"},
+        description=(
+            "react_probability 未命中时仍然挤一句 silent_replies 的概率。"
+            "意义上等价于「装看不见但偶尔抱怨一下」"
+        ),
+        json_schema_extra={
+            "label": "沉默时发言概率",
+            "x-widget": "slider",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+        },
     )
-    text_probability: float = Field(
-        default=0.2,
+    text_weight: float = Field(
+        default=0.3,
         ge=0.0,
         le=1.0,
-        description="反应时选择文字回复的占比；四种反应权重会按总和归一化，不要求加起来等于 1",
-        json_schema_extra={"label": "文字占比"},
+        description="反应时选择文字回复的权重；三种权重按总和归一化，不要求加起来等于 1",
+        json_schema_extra={"label": "文字权重"},
     )
 
     min_delay_seconds: float = Field(
@@ -227,19 +233,6 @@ class EmojiSection(PluginConfigBase):
         description="选择表情包时使用的描述关键词，将随机抽取其一调用 emoji.get_by_description",
         json_schema_extra={"label": "表情关键词"},
     )
-    min_similarity: float = Field(
-        default=0.45,
-        ge=0.0,
-        le=1.0,
-        description="按关键词匹配到的表情包相似度阈值，低于此值将放弃发表情、回退到回戳",
-        json_schema_extra={
-            "label": "表情相似度阈值",
-            "x-widget": "slider",
-            "min": 0.0,
-            "max": 1.0,
-            "step": 0.05,
-        },
-    )
     allow_random_fallback: bool = Field(
         default=False,
         description="按关键词没找到合适表情时是否回退到随机表情（默认关闭，更倾向于回戳）",
@@ -258,7 +251,7 @@ class BystanderSection(PluginConfigBase):
         json_schema_extra={"label": "启用跟风戳"},
     )
     probability: float = Field(
-        default=0.15,
+        default=0.85,
         ge=0.0,
         le=1.0,
         description="别人互戳时麦麦跟风戳的概率",
@@ -367,60 +360,90 @@ class PokeContext:
 
 
 class PokeStateManager:
-    """跨实例共享的状态：冷却时间戳与每用户戳次数窗口。"""
+    """每个插件实例独立持有的状态：冷却时间戳与每用户戳次数窗口。
 
-    _last_react_at: Dict[str, float] = {}
-    _poke_records: Dict[str, List[float]] = defaultdict(list)
-    _last_bystander_at: Dict[str, float] = {}
+    设计要点：
+    - 戳麦麦冷却按 ``stream_id:poker_id`` 维度计：不同人独立冷却，A 触发冷却不阻挡 B。
+    - 跟风戳冷却按 ``stream_id`` 维度计：避免麦麦在群里跟风刷屏。
+    - 暴戳计数同样按 ``stream_id:poker_id`` 维度，与戳麦麦冷却一致。
+    - 字典 key 不会自动消失，因此在 record_poke_and_count 中按计数触发 _prune。
+    """
 
-    @classmethod
-    def in_cooldown(cls, stream_id: str, cooldown_seconds: int) -> bool:
+    _PRUNE_THRESHOLD = 200
+    _STALE_AFTER_SECONDS = 3600
+
+    def __init__(self) -> None:
+        self._last_react_at: Dict[str, float] = {}
+        self._poke_records: Dict[str, List[float]] = defaultdict(list)
+        self._last_bystander_at: Dict[str, float] = {}
+        self._record_counter: int = 0
+
+    @staticmethod
+    def _cooldown_key(stream_id: str, poker_id: str) -> str:
+        if not stream_id:
+            return ""
+        return f"{stream_id}:{poker_id}" if poker_id else stream_id
+
+    def in_cooldown(self, stream_id: str, poker_id: str, cooldown_seconds: int) -> bool:
         if cooldown_seconds <= 0 or not stream_id:
             return False
-        last = cls._last_react_at.get(stream_id, 0.0)
+        key = self._cooldown_key(stream_id, poker_id)
+        last = self._last_react_at.get(key, 0.0)
         return (time.time() - last) < cooldown_seconds
 
-    @classmethod
-    def mark_reacted(cls, stream_id: str) -> None:
-        if stream_id:
-            cls._last_react_at[stream_id] = time.time()
+    def mark_reacted(self, stream_id: str, poker_id: str) -> None:
+        key = self._cooldown_key(stream_id, poker_id)
+        if key:
+            self._last_react_at[key] = time.time()
 
-    @classmethod
-    def in_bystander_cooldown(cls, stream_id: str, cooldown_seconds: int) -> bool:
+    def in_bystander_cooldown(self, stream_id: str, cooldown_seconds: int) -> bool:
         if cooldown_seconds <= 0 or not stream_id:
             return False
-        last = cls._last_bystander_at.get(stream_id, 0.0)
+        last = self._last_bystander_at.get(stream_id, 0.0)
         return (time.time() - last) < cooldown_seconds
 
-    @classmethod
-    def mark_bystander(cls, stream_id: str) -> None:
+    def mark_bystander(self, stream_id: str) -> None:
         if stream_id:
-            cls._last_bystander_at[stream_id] = time.time()
+            self._last_bystander_at[stream_id] = time.time()
 
-    @classmethod
     def record_poke_and_count(
-        cls, stream_id: str, poker_id: str, window_seconds: int
+        self, stream_id: str, poker_id: str, window_seconds: int
     ) -> int:
         """记录一次戳，返回窗口期内的累计次数。"""
         key = f"{stream_id}:{poker_id}"
         now = time.time()
         cutoff = now - max(window_seconds, 1)
-        records = [t for t in cls._poke_records[key] if t >= cutoff]
+        records = [t for t in self._poke_records[key] if t >= cutoff]
         records.append(now)
-        cls._poke_records[key] = records
+        self._poke_records[key] = records
+
+        self._record_counter += 1
+        if self._record_counter >= self._PRUNE_THRESHOLD:
+            self._record_counter = 0
+            self._prune()
         return len(records)
 
-    @classmethod
-    def clear(cls) -> None:
-        cls._last_react_at.clear()
-        cls._poke_records.clear()
-        cls._last_bystander_at.clear()
+    def _prune(self) -> None:
+        """删除超过 _STALE_AFTER_SECONDS 未更新的 key，控制字典体积。"""
+        cutoff = time.time() - self._STALE_AFTER_SECONDS
+        self._last_react_at = {k: v for k, v in self._last_react_at.items() if v >= cutoff}
+        self._last_bystander_at = {k: v for k, v in self._last_bystander_at.items() if v >= cutoff}
+        self._poke_records = defaultdict(
+            list,
+            {k: v for k, v in self._poke_records.items() if v and max(v) >= cutoff},
+        )
+
+    def clear(self) -> None:
+        self._last_react_at.clear()
+        self._poke_records.clear()
+        self._last_bystander_at.clear()
+        self._record_counter = 0
 
 
 # --- 辅助函数 ---
 
 
-def _safe_int(value: Any) -> Optional[int]:
+def _to_positive_int(value: Any) -> Optional[int]:
     """把任意输入安全转成正整数，失败返回 None。"""
     try:
         text = str(value).strip()
@@ -453,12 +476,15 @@ class SmartPokePlugin(MaiBotPlugin):
         super().__init__()
         self._blacklist: set[str] = set()
         self._pending_tasks: set[asyncio.Task] = set()
+        self._state = PokeStateManager()
 
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
         self._refresh_user_sets()
-        logger.info("智能戳一戳插件 v%s 已就绪。", PLUGIN_VERSION)
+        self.ctx.logger.info("智能戳一戳插件 v%s 已就绪。", PLUGIN_VERSION)
+        # 探测一次表情库的 emotion 标签，提示用户关键词命中情况
+        self._spawn_background_task(self._check_emoji_emotions(), "emoji_emotion_check")
 
     async def on_unload(self) -> None:
         # 取消未完成的反应任务，避免 Runner 卸载后还在调用 capability
@@ -466,19 +492,79 @@ class SmartPokePlugin(MaiBotPlugin):
             if not task.done():
                 task.cancel()
         self._pending_tasks.clear()
-        PokeStateManager.clear()
+        self._state.clear()
 
     async def on_config_update(
         self, scope: str, config_data: dict, version: str
     ) -> None:
         if scope == "self":
             self._refresh_user_sets()
-            logger.info("配置已热更新到 v%s。", version)
+            self.ctx.logger.info("配置已热更新到 v%s。", version)
 
     def _refresh_user_sets(self) -> None:
         """把配置中的黑名单归一化成字符串集合，便于 O(1) 查询。"""
         cfg = self.config
         self._blacklist = {str(x).strip() for x in cfg.user_control.blacklist if str(x).strip()}
+
+    def _spawn_background_task(self, coro: Any, label: str, timeout: float = 60.0) -> None:
+        """提交后台任务并登记到 _pending_tasks；带超时兜底防止挂死。
+
+        子协程内部理应已有 try/except，本封装的超时只是最后一道防护：
+        - 60 秒应当足够覆盖任何戳反应路径（最大延迟 + 几次 RPC）。
+        - 触发 TimeoutError 时 wait_for 会取消子协程，输出 warning。
+        """
+
+        async def _runner() -> None:
+            try:
+                await asyncio.wait_for(coro, timeout=timeout)
+            except asyncio.TimeoutError:
+                self.ctx.logger.warning("[%s] 后台任务超时 %ss，已取消", label, timeout)
+            except Exception:
+                self.ctx.logger.exception("[%s] 后台任务异常", label)
+
+        task = asyncio.create_task(_runner())
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+
+    async def _check_emoji_emotions(self) -> None:
+        """启动时探测一次表情库 emotion 标签，与配置的 description_keywords 求交集。
+
+        若完全不交集，说明按关键词搜表情会一直失败，应当提示用户调整 keywords
+        或允许随机回退。SDK 已自动解包 emoji.get_emotions，直接返回 emotion 字符串列表。
+        """
+        try:
+            emotions = await self.ctx.emoji.get_emotions()
+            if not isinstance(emotions, list):
+                self.ctx.logger.debug("表情库尚未提供 emotion 标签，跳过交集校验")
+                return
+            emotion_set = {str(e).strip() for e in emotions if str(e).strip()}
+            if not emotion_set:
+                return
+
+            configured = {
+                str(k).strip()
+                for k in self.config.emoji.description_keywords
+                if str(k).strip()
+            }
+            if not configured:
+                return
+
+            intersection = configured & emotion_set
+            if intersection:
+                self.ctx.logger.info(
+                    "emoji.description_keywords 命中 %d/%d 个 emotion 标签",
+                    len(intersection), len(configured),
+                )
+                return
+
+            sample = ", ".join(sorted(emotion_set)[:10])
+            self.ctx.logger.warning(
+                "配置的 emoji.description_keywords 与表情库 emotion 标签无交集，"
+                "按关键词搜表情会持续失败。可用 emotion 示例: %s",
+                sample or "(空)",
+            )
+        except Exception:
+            self.ctx.logger.debug("emoji emotion 校验失败", exc_info=True)
 
     # ===== Hook 入口 =====
 
@@ -516,40 +602,50 @@ class SmartPokePlugin(MaiBotPlugin):
 
         # 黑名单：拦截但不反应
         if ctx.poker_id in self._blacklist:
-            logger.debug("黑名单用户 %s 的戳一戳已静默拦截", ctx.poker_id)
+            self.ctx.logger.debug("黑名单用户 %s 的戳一戳已静默拦截", ctx.poker_id)
             return {"action": "abort"}
 
-        # 群聊/私聊总开关
+        # 群聊/私聊总开关：关闭场景下放行事件，让 Host 自行处理
         if ctx.is_group and not self.config.reaction.react_in_group:
-            return {"action": "abort"}
+            return None
         if not ctx.is_group and not self.config.reaction.react_in_private:
-            return {"action": "abort"}
+            return None
 
-        # 冷却
-        if PokeStateManager.in_cooldown(
-            ctx.stream_id, self.config.reaction.cooldown_seconds
-        ):
-            logger.debug("[%s] 戳一戳冷却中，已拦截", ctx.stream_id or ctx.group_id or ctx.poker_id)
-            return {"action": "abort"}
-
-        # 反应概率
-        if random.random() > self.config.reaction.react_probability:
-            logger.debug("[%s] 戳一戳触发概率未命中，静默拦截", ctx.stream_id or ctx.poker_id)
-            return {"action": "abort"}
-
-        # 记录一次戳并判定是否进入「被烦」
-        poke_count = PokeStateManager.record_poke_and_count(
+        # 暴戳计数：通过黑名单/场景检查后立即累计，与是否反应解耦，
+        # 否则连续戳但概率没命中时永远进不了「被烦」状态。
+        poke_count = self._state.record_poke_and_count(
             ctx.stream_id or ctx.group_id or ctx.poker_id,
             ctx.poker_id,
             self.config.reaction.spam_window_seconds,
         )
         is_spam = poke_count >= self.config.reaction.spam_threshold
-        PokeStateManager.mark_reacted(ctx.stream_id)
+
+        # 冷却（按 stream_id+poker_id 维度：不同人独立冷却）
+        if self._state.in_cooldown(
+            ctx.stream_id, ctx.poker_id, self.config.reaction.cooldown_seconds
+        ):
+            self.ctx.logger.debug(
+                "[%s:%s] 戳一戳冷却中，已拦截",
+                ctx.stream_id or ctx.group_id, ctx.poker_id,
+            )
+            return {"action": "abort"}
+
+        # 反应概率
+        if random.random() > self.config.reaction.react_probability:
+            self.ctx.logger.debug("[%s] 戳一戳触发概率未命中，静默拦截", ctx.stream_id or ctx.poker_id)
+            # 未命中也按 silent_chat_probability 概率偶尔挤一句 silent_replies
+            chat_prob = self.config.reaction.silent_chat_probability
+            if chat_prob > 0 and random.random() < chat_prob:
+                self._spawn_background_task(self._silent_reply(ctx), "silent_reply")
+            return {"action": "abort"}
+
+        self._state.mark_reacted(ctx.stream_id, ctx.poker_id)
 
         # 异步执行反应（避免阻塞 Hook 链）
-        task = asyncio.create_task(self._react(ctx, is_spam, poke_count))
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        self._spawn_background_task(
+            self._react(ctx, is_spam, poke_count),
+            "react",
+        )
 
         # 拦截事件，避免 Host 把 "XX 发起了戳一戳" 当成普通消息再走一遍消息流程
         return {"action": "abort"}
@@ -567,12 +663,9 @@ class SmartPokePlugin(MaiBotPlugin):
         # 戳的人或被戳的人是麦麦自己：交给主分支处理
         if ctx.poker_id == ctx.self_id or ctx.target_id == ctx.self_id:
             return
-        # 黑名单中的人发起的戳不响应
-        if ctx.poker_id in self._blacklist:
-            return
         # 冷却
         bystander_key = ctx.stream_id or ctx.group_id
-        if PokeStateManager.in_bystander_cooldown(bystander_key, cfg.cooldown_seconds):
+        if self._state.in_bystander_cooldown(bystander_key, cfg.cooldown_seconds):
             return
         # 概率
         if random.random() > cfg.probability:
@@ -582,15 +675,18 @@ class SmartPokePlugin(MaiBotPlugin):
         target_id = self._pick_bystander_target(ctx)
         if not target_id:
             return
-        # 目标在黑名单也不戳，避免被反向"恶意操控"
+        # 黑名单仅决定"麦麦不主动戳此人"——
+        # 发起者 (poker) 在黑名单里也不阻止跟风戳被戳者的场景，
+        # 只在最终目标命中黑名单时跳过。
         if target_id in self._blacklist:
             return
 
-        PokeStateManager.mark_bystander(bystander_key)
+        self._state.mark_bystander(bystander_key)
 
-        task = asyncio.create_task(self._react_bystander(ctx, target_id))
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        self._spawn_background_task(
+            self._react_bystander(ctx, target_id),
+            "bystander",
+        )
 
     def _pick_bystander_target(self, ctx: PokeContext) -> str:
         """根据策略挑选要跟风戳的对象。"""
@@ -612,12 +708,12 @@ class SmartPokePlugin(MaiBotPlugin):
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            target_int = _safe_int(target_id)
+            target_int = _to_positive_int(target_id)
             if target_int is None:
                 return
             call_kwargs: Dict[str, Any] = {"user_id": target_int}
             if ctx.is_group:
-                group_int = _safe_int(ctx.group_id)
+                group_int = _to_positive_int(ctx.group_id)
                 if group_int is None:
                     return
                 call_kwargs["group_id"] = group_int
@@ -627,37 +723,55 @@ class SmartPokePlugin(MaiBotPlugin):
                     "adapter.napcat.message.send_poke", **call_kwargs
                 )
                 if isinstance(resp, dict) and resp.get("success") is False:
-                    logger.warning("跟风戳调用失败: %s", resp.get("error"))
+                    self.ctx.logger.warning("跟风戳调用失败: %s", resp.get("error"))
                     return
-                logger.info(
+                self.ctx.logger.info(
                     "[smart_poke] 跟风戳完成: strategy=%s, target=%s (poker=%s, victim=%s)",
                     self.config.bystander.target_strategy,
                     target_id, ctx.poker_id, ctx.target_id,
                 )
             except Exception:
-                logger.exception("跟风戳调用异常")
+                self.ctx.logger.exception("跟风戳调用异常")
         except Exception:
-            logger.exception("跟风戳任务异常")
+            self.ctx.logger.exception("跟风戳任务异常")
 
     # ===== 反应主流程 =====
+
+    async def _silent_reply(self, ctx: PokeContext) -> None:
+        """react_probability 未命中时按 silent_chat_probability 概率挤出的一句轻反应。
+
+        和 _react 不同：不消耗冷却、不参与反应类型抽样，只挑一句 silent_replies。
+        """
+        try:
+            await self._delay_a_bit()
+            stream_id = await self._resolve_stream_id(ctx)
+            if not stream_id:
+                return
+            pool = self.config.fallback.silent_replies
+            if not pool:
+                return
+            await self._safe_send_text(random.choice(pool), stream_id)
+        except Exception:
+            self.ctx.logger.exception("silent_reply 发送失败")
 
     async def _react(self, ctx: PokeContext, is_spam: bool, poke_count: int) -> None:
         """决定反应类型并执行；外层捕获所有异常防止背景任务挂掉。"""
         try:
             await self._delay_a_bit()
 
-            # napcat 注入的 notice 消息 session_id 形如 "napcat-notice-xxx"，
-            # 用它发消息会让 Host 内部 hook 找不到合法的 group_info，
-            # 因此群聊/私聊场景都强制按 group_id / user_id 回查真实 stream_id。
+            # napcat 注入的 notice 消息 session_id 字段是空字符串，
+            # 必须按 group_id / user_id 回查真实 stream_id 才能发文字/表情。
+            # 回戳走适配器 send_poke 直接用 group_id/user_id，不依赖 stream_id，
+            # 因此即便 stream_id 解析失败，回戳路径仍然可用。
             stream_id = await self._resolve_stream_id(ctx)
             if not stream_id:
-                stream_id = ctx.stream_id  # 兜底，避免完全发不出
-            if not stream_id and ctx.is_group:
-                logger.warning("无法解析群 %s 的 stream_id，放弃反应", ctx.group_id)
-                return
+                self.ctx.logger.debug(
+                    "[smart_poke] 无法解析 stream_id (group=%s, poker=%s)，文字/表情将跳过",
+                    ctx.group_id, ctx.poker_id,
+                )
 
             kind = self._decide_reaction_kind(is_spam)
-            logger.info(
+            self.ctx.logger.info(
                 "[smart_poke] 触发反应: kind=%s, is_spam=%s, poke_count=%d, poker=%s, scene=%s",
                 kind,
                 is_spam,
@@ -670,34 +784,28 @@ class SmartPokePlugin(MaiBotPlugin):
                 ok = await self._send_back_poke(ctx)
                 if not ok and stream_id:
                     # 回戳失败 → 回退文字
-                    await self._send_text(ctx, stream_id, is_spam, poke_count)
+                    await self._send_text(stream_id, is_spam)
                 return
 
             if kind == "emoji":
                 ok = await self._send_emoji(stream_id) if stream_id else False
                 if ok:
                     return
-                # 表情匹配不到或相似度太低 → 回退到回戳
-                logger.debug("表情反应失败/被相似度阈值过滤，回退到回戳")
+                # 表情发送失败 / 没有 stream_id → 回退到回戳
+                self.ctx.logger.debug("表情反应失败，回退到回戳")
                 ok_poke = await self._send_back_poke(ctx)
                 if not ok_poke and stream_id:
                     # 回戳也失败再退到文字
-                    await self._send_text(ctx, stream_id, is_spam, poke_count)
+                    await self._send_text(stream_id, is_spam)
                 return
 
-            if kind == "silent":
-                # 小概率挤出一句极简回复，否则真的沉默
-                if stream_id and random.random() < 0.3:
-                    pool = self.config.fallback.silent_replies
-                    if pool:
-                        await self._safe_send_text(random.choice(pool), stream_id)
-                return
-
-            # 默认：文字
+            # 默认：文字。没有 stream_id 时退一步用回戳兜底，避免完全没反应
             if stream_id:
-                await self._send_text(ctx, stream_id, is_spam, poke_count)
+                await self._send_text(stream_id, is_spam)
+            else:
+                await self._send_back_poke(ctx)
         except Exception:
-            logger.exception("反应戳一戳时出错")
+            self.ctx.logger.exception("反应戳一戳时出错")
 
     async def _delay_a_bit(self) -> None:
         """按配置范围随机延迟，模拟思考时间。"""
@@ -709,18 +817,19 @@ class SmartPokePlugin(MaiBotPlugin):
             await asyncio.sleep(delay)
 
     def _decide_reaction_kind(self, is_spam: bool) -> str:
-        """按配置权重选择反应类型。返回 'poke' / 'emoji' / 'silent' / 'text'。
+        """按配置权重选择反应类型。返回 'poke' / 'emoji' / 'text'。
 
-        四个权重独立配置，不要求加起来等于 1：取它们的总和后归一化分配。
-        暴戳时会削弱回戳权重、抬高沉默和文字权重，让麦麦更倾向"嫌烦"而不是回戳。
+        三个权重独立配置，不要求加起来等于 1：取它们的总和后归一化分配。
+        暴戳时会削弱回戳权重、抬高文字权重，让麦麦更倾向"嫌烦"地说话而不是回戳。
+        「真正沉默」由 handle_poke_event 中的 react_probability 未命中分支负责，
+        与本方法的反应类型抽样无关。
         """
         cfg = self.config.reaction
         spam_mult_text = 1.5 if is_spam else 1.0
         weights = {
-            "poke": max(0.0, cfg.back_poke_probability * (0.5 if is_spam else 1.0)),
-            "emoji": max(0.0, cfg.emoji_probability),
-            "silent": max(0.0, cfg.silent_probability + (0.15 if is_spam else 0.0)),
-            "text": max(0.0, cfg.text_probability * spam_mult_text),
+            "poke": max(0.0, cfg.back_poke_weight * (0.5 if is_spam else 1.0)),
+            "emoji": max(0.0, cfg.emoji_weight),
+            "text": max(0.0, cfg.text_weight * spam_mult_text),
         }
         total = sum(weights.values())
         if total <= 0:
@@ -743,13 +852,13 @@ class SmartPokePlugin(MaiBotPlugin):
         - 群聊：同时传 ``user_id``（被戳者）和 ``group_id``。
         - 私聊：仅传 ``user_id``，省略 ``group_id``。
         """
-        poker_int = _safe_int(ctx.poker_id)
+        poker_int = _to_positive_int(ctx.poker_id)
         if poker_int is None:
             return False
 
         call_kwargs: Dict[str, Any] = {"user_id": poker_int}
         if ctx.is_group:
-            group_int = _safe_int(ctx.group_id)
+            group_int = _to_positive_int(ctx.group_id)
             if group_int is None:
                 return False
             call_kwargs["group_id"] = group_int
@@ -759,22 +868,15 @@ class SmartPokePlugin(MaiBotPlugin):
                 "adapter.napcat.message.send_poke", **call_kwargs
             )
             if isinstance(resp, dict) and resp.get("success") is False:
-                logger.warning("回戳调用失败: %s", resp.get("error"))
+                self.ctx.logger.warning("回戳调用失败: %s", resp.get("error"))
                 return False
             return True
         except Exception:
-            logger.exception("发送回戳异常")
+            self.ctx.logger.exception("发送回戳异常")
             return False
 
-    async def _send_text(
-        self,
-        ctx: PokeContext,
-        stream_id: str,
-        is_spam: bool,
-        poke_count: int,
-    ) -> None:
+    async def _send_text(self, stream_id: str, is_spam: bool) -> None:
         """从配置的回复池中随机挑一句文字发出。"""
-        del ctx, poke_count  # 当前实现不依赖 ctx 和计数
         pool = (
             self.config.fallback.spam_replies
             if is_spam
@@ -787,94 +889,62 @@ class SmartPokePlugin(MaiBotPlugin):
         try:
             await self.ctx.send.text(text, stream_id)
         except Exception:
-            logger.exception("发送文字回复失败")
+            self.ctx.logger.exception("发送文字回复失败")
 
     async def _send_emoji(self, stream_id: str) -> bool:
-        """发送一张表情包。优先按关键词搜索，找不到则随机。"""
+        """发送一张表情包。Host 序列化表情时固定输出 ``base64`` 字段。"""
         try:
             emoji = await self._pick_emoji()
-            if not emoji:
+            if not isinstance(emoji, dict):
                 return False
 
-            emoji_data = ""
-            if isinstance(emoji, dict):
-                for key in (
-                    "emoji_base64",
-                    "base64",
-                    "image_base64",
-                    "data",
-                    "content",
-                ):
-                    value = emoji.get(key)
-                    if isinstance(value, str) and value:
-                        emoji_data = value
-                        break
-
-            if not emoji_data:
+            emoji_data = emoji.get("base64")
+            if not isinstance(emoji_data, str) or not emoji_data:
                 return False
 
             await self.ctx.send.emoji(emoji_data, stream_id)
             return True
         except Exception:
-            logger.exception("发送表情失败")
+            self.ctx.logger.exception("发送表情失败")
             return False
 
     async def _pick_emoji(self) -> Optional[Dict[str, Any]]:
-        """按关键词搜表情包，相似度低于阈值或没结果时返回 None。
+        """挑一张表情包。优先按关键词搜，找不到时按配置回退随机。
 
-        默认不回退到随机表情，因为随机表情与"被戳"语境无关，
-        让 _react 在 None 时回退去回戳更合理。可在配置里打开 allow_random_fallback。
+        SDK 已经按 ``_CAPABILITY_RESULT_KEYS`` 表自动解包 RPC 响应：
+        - ``emoji.get_by_description`` 直接返回 ``{"base64": ..., "description": ..., "emotion": ...}`` 或 ``None``。
+        - ``emoji.get_random`` 直接返回 ``[{...}, ...]`` 列表。
+
+        会按随机顺序最多遍历 3 个关键词，遇到首个命中即返回。
         """
         keywords = [k for k in self.config.emoji.description_keywords if str(k).strip()]
-        threshold = self.config.emoji.min_similarity
 
         if keywords:
-            try:
-                kw = random.choice(keywords)
-                hit = await self.ctx.emoji.get_by_description(kw, limit=1)
-                candidate: Optional[Dict[str, Any]] = None
-                if isinstance(hit, list) and hit and isinstance(hit[0], dict):
-                    candidate = hit[0]
-                elif isinstance(hit, dict):
-                    candidate = hit
-
-                if candidate is not None:
-                    similarity = self._extract_emoji_similarity(candidate)
-                    if similarity >= threshold:
-                        return candidate
-                    logger.debug(
-                        "表情匹配相似度 %.3f 低于阈值 %.2f（关键词=%s），放弃发表情",
-                        similarity, threshold, kw,
-                    )
-            except Exception:
-                logger.debug("emoji.get_by_description 失败", exc_info=True)
+            shuffled = keywords[:]
+            random.shuffle(shuffled)
+            for kw in shuffled[:3]:
+                try:
+                    emoji = await self.ctx.emoji.get_by_description(kw, limit=1)
+                    if isinstance(emoji, dict) and emoji:
+                        return emoji
+                    self.ctx.logger.debug("按关键词 %s 没找到合适表情", kw)
+                except Exception:
+                    self.ctx.logger.debug("emoji.get_by_description 失败 (kw=%s)", kw, exc_info=True)
 
         if not self.config.emoji.allow_random_fallback:
             return None
 
         try:
-            rand = await self.ctx.emoji.get_random(1)
-            if isinstance(rand, list) and rand:
-                return rand[0] if isinstance(rand[0], dict) else None
-            if isinstance(rand, dict):
-                return rand
+            emojis = await self.ctx.emoji.get_random(1)
+            if isinstance(emojis, list):
+                for item in emojis:
+                    if isinstance(item, dict) and item:
+                        return item
+            elif isinstance(emojis, dict) and emojis:
+                return emojis
         except Exception:
-            logger.debug("emoji.get_random 失败", exc_info=True)
+            self.ctx.logger.debug("emoji.get_random 失败", exc_info=True)
         return None
-
-    @staticmethod
-    def _extract_emoji_similarity(emoji: Dict[str, Any]) -> float:
-        """从表情字典里尽量找到相似度数值；找不到视为 0。"""
-        for key in ("similarity", "score", "similarity_score", "match_score"):
-            value = emoji.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-            if isinstance(value, str):
-                try:
-                    return float(value)
-                except ValueError:
-                    continue
-        return 0.0
 
     # ===== 信息提取 =====
 
@@ -956,7 +1026,7 @@ class SmartPokePlugin(MaiBotPlugin):
                     or ""
                 )
         except Exception:
-            logger.debug("回查 stream_id 失败", exc_info=True)
+            self.ctx.logger.debug("回查 stream_id 失败", exc_info=True)
         return ""
 
 
