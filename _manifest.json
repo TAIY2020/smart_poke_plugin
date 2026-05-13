@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "name": "智能戳一戳插件 | Smart Poke Plugin",
-  "description": "拟人化 QQ 戳一戳响应插件：被戳时根据人设、上下文和概率，自然地回戳、文字调侃、发表情或选择性沉默。支持暴戳检测、冷却限频与黑白名单。",
+  "description": "一个让麦麦在 QQ 戳一戳里尽量像真人一样反应的拟人化交互插件。",
   "author": {
     "name": "TaiYang",
     "url": "https://github.com/TAIY2020"
@@ -31,7 +31,8 @@
     "emoji.get_by_description",
     "emoji.get_emotions",
     "chat.get_stream_by_group_id",
-    "chat.get_stream_by_user_id"
+    "chat.get_stream_by_user_id",
+    "message.get_recent"
   ],
   "i18n": {
     "default_locale": "zh-CN",
