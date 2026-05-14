@@ -41,29 +41,29 @@
 ```toml
 [plugin]
 name = "smart_poke_plugin"
-version = "1.3.0"
-config_version = "1.3.0"
+version = "1.4.0"
+config_version = "1.4.0"
 enabled = true
 
 [reaction]
 react_probability = 0.85
-back_poke_weight = 0.4
+back_poke_weight = 0.5
 emoji_weight = 0.3
-text_weight = 0.2
+text_weight = 0.1
 silent_chat_probability = 0.1
 swallow_when_silent = true
 min_delay_seconds = 1.0
 max_delay_seconds = 2.5
 cooldown_seconds = 8
 max_reactions_per_minute = 6
-back_poke_max_times = 2
-spam_threshold = 3
+back_poke_max_times = 3
+spam_threshold = 5
 spam_window_seconds = 45
 react_in_group = true
 react_in_private = true
 
 [fallback]
-normal_replies = ["干嘛戳我", "诶诶诶，戳什么戳", "干啥"]
+normal_replies = ["干嘛戳我", "戳什么戳", "干啥"]
 spam_replies = ["你戳够了没", "好烦别戳了", "你是不是没事干", "停！手！", "烦不烦", "SB吧"]
 silent_replies = ["...", "？？？", "，，，"]
 
@@ -91,12 +91,13 @@ active_hour_start = 9
 active_hour_end = 24
 per_chat_cooldown_seconds = 600
 global_cooldown_seconds = 90
-max_pokes_per_day = 30
+max_pokes_per_day = 3
 lookback_seconds = 1800
 recent_window_seconds = 300
 recent_fetch_limit = 100
 min_recent_messages = 3
 respect_spam_history = true
+respect_spam_window_seconds = 600
 target_strategy = "active_speaker"
 min_delay_seconds = 2.0
 max_delay_seconds = 6.0
@@ -156,6 +157,7 @@ blacklist_groups = []
 
 - 反应风格偏向文字，语气更冲，从「暴戳回复池」里抽话。
 - 如果抽中回戳，会连戳几下（次数取决于「回戳次数上限」），把"我不耐烦了"演到位。
+- 文字反应兜底链只在「暴戳回复池」与「普通回复池」之间回退，**不会落到「沉默回复池」**——暴戳态下蹦个 `...` 反差太大；前两档都为空时会自动改走回戳，避免失声。
 - 跟风戳和主动戳不受影响。
 
 ### 配置项说明
@@ -167,17 +169,17 @@ blacklist_groups = []
 | 配置项（Web UI / TOML） | 默认值 | 说明 |
 | ------ | ------ | ---- |
 | 反应概率（`react_probability`） | `0.85` | 被戳时做出反应的概率，越大越爱搭理 |
-| 回戳权重（`back_poke_weight`） | `0.4` | 反应里"回戳"的权重 |
+| 回戳权重（`back_poke_weight`） | `0.5` | 反应里"回戳"的权重 |
 | 表情权重（`emoji_weight`） | `0.3` | 反应里"表情包"的权重 |
-| 文字权重（`text_weight`） | `0.2` | 反应里"文字"的权重（三个权重不要求加起来等于 1） |
+| 文字权重（`text_weight`） | `0.1` | 反应里"文字"的权重（三个权重不要求加起来等于 1） |
 | 沉默时发言概率（`silent_chat_probability`） | `0.1` | 装作没看见时偶尔嘀咕一句的概率 |
 | 沉默时吞事件（`swallow_when_silent`） | `true` | 沉默时是否完全吞掉事件；关闭后会把事件放行给主程序自带的回应 |
 | 最小延迟（秒）（`min_delay_seconds`） | `1.0` | 反应前的随机思考延迟下限 |
 | 最大延迟（秒）（`max_delay_seconds`） | `2.5` | 反应前的随机思考延迟上限 |
 | 冷却时长（秒）（`cooldown_seconds`） | `8` | 同一个人戳麦麦的冷却时长 |
 | 每分钟反应上限（`max_reactions_per_minute`） | `6` | 1 分钟内反应次数上限，0 表示不限制 |
-| 回戳次数上限（`back_poke_max_times`） | `2` | 回戳连续次数上限，默认 2 让暴戳态连戳两下；调到 1 退化为单次，调到 3~5 更狠 |
-| 暴戳阈值（`spam_threshold`） | `3` | 进入暴戳状态需要的连续戳次数 |
+| 回戳次数上限（`back_poke_max_times`） | `3` | 回戳连续次数上限，默认 3 让暴戳态连戳几下；调到 1 退化为单次，调到 3~5 更狠 |
+| 暴戳阈值（`spam_threshold`） | `5` | 进入暴戳状态需要的连续戳次数 |
 | 暴戳窗口（秒）（`spam_window_seconds`） | `45` | 暴戳判定的时间窗口 |
 | 群聊响应（`react_in_group`） | `true` | 是否在群聊中响应戳一戳 |
 | 私聊响应（`react_in_private`） | `true` | 是否在私聊中响应戳一戳 |
@@ -226,12 +228,13 @@ blacklist_groups = []
 | 活跃时段结束（小时）（`active_hour_end`） | `24` | 主动戳活跃时段终点（24h 制，支持跨午夜） |
 | 同群冷却（秒）（`per_chat_cooldown_seconds`） | `600` | 同一群两次主动戳的最小间隔 |
 | 全局冷却（秒）（`global_cooldown_seconds`） | `90` | 任意两次主动戳的全局最小间隔 |
-| 每日上限（`max_pokes_per_day`） | `30` | 每天主动戳的次数上限，0 表示不限制 |
+| 每日上限（`max_pokes_per_day`） | `3` | 每天主动戳的次数上限，0 表示不限制 |
 | 候选活跃窗口（秒）（`lookback_seconds`） | `1800` | 多久以内说过话的人会被纳入候选 |
 | 群活跃统计窗口（秒）（`recent_window_seconds`） | `300` | 用于判定群是否活跃的统计窗口 |
 | 拉取消息条数（`recent_fetch_limit`） | `100` | 每次主动戳时拉取最近多少条消息用于候选与活跃度判断 |
 | 群活跃门槛（条）（`min_recent_messages`） | `3` | 群活跃门槛：统计窗口内至少要有这么多条消息才考虑出手 |
-| 尊重 spam 历史（`respect_spam_history`） | `true` | 是否避开"最近戳过麦麦的人"，避免报复性骚扰 |
+| 避开骚扰过麦麦的人（`respect_spam_history`） | `true` | 是否避开"最近戳过麦麦的人"，避免报复性骚扰 |
+| 避开戳过麦麦的窗口（秒）（`respect_spam_window_seconds`） | `600` | "避开戳过麦麦的人"使用的回溯窗口；独立于 `reaction.spam_window_seconds`（后者用于暴戳态判定，默认仅 45 秒），默认 10 分钟更克制 |
 | 目标策略（`target_strategy`） | `刚说话的人` | 目标策略：刚说话的人 / 随机活跃用户 |
 | 最小延迟（秒）（`min_delay_seconds`） | `2.0` | 主动戳思考延迟下限 |
 | 最大延迟（秒）（`max_delay_seconds`） | `6.0` | 主动戳思考延迟上限 |
@@ -242,9 +245,8 @@ blacklist_groups = []
 
 ## 📝 注意事项
 
-- **依赖 NapCat 适配器**: 戳一戳事件来源于 `MaiBot-Napcat-Adapter`，调用回戳、主动戳也都走这个适配器。没装它本插件不会有任何反应。
 - **默认配置已经调好**: 大多数场景下默认值足够用，不建议一上来就大改概率或冷却。觉得麦麦太活跃就在 Web UI 里把「反应概率」「跟风戳概率」「出手概率」往小调；反之亦然。
-- **主动戳的"克制感"**: 默认每天最多 30 次、同群冷却 10 分钟、凌晨不戳人——这些组合起来才是它"像真人"的关键。如果觉得麦麦不太主动，可以试试调大「出手概率」或缩短「同群冷却（秒）」，但建议幅度小一点慢慢试。
+- **主动戳的"克制感"**: 默认每天最多 3 次、同群冷却 10 分钟、凌晨不戳人——这些组合起来才是它"像真人"的关键。如果觉得麦麦不太主动，可以试试调大「出手概率」或缩短「同群冷却（秒）」，但建议幅度小一点慢慢试。
 - **配置热重载**: 通过 Web UI 修改配置后会自动生效，不需要重启麦麦。
 
 Enjoy! 🎉

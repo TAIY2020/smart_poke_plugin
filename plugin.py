@@ -31,11 +31,6 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from pydantic import field_validator
 
 
-# 模块级 stdlib logger：在 ctx.logger 不可用的位置兜底。
-# field_validator 是 classmethod，构造期还拿不到 self.ctx；
-# _load_manifest_version() 在模块导入期就要打日志，也走它。
-# 用 __name__ 让 logger 落在与 Runner IPC handler 对齐的命名空间下，
-# 主进程侧按 logger 名做过滤/分组时能正确归属到本插件。
 _module_logger = logging.getLogger(__name__)
 
 
@@ -57,10 +52,7 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-# 配置 schema 版本：与 PLUGIN_VERSION 独立追踪，仅在 SmartPokeConfig 字段结构变更时手动 bump。
-# 与插件版本绑定会让每次发版都把用户的 config_version 顶到新值，将来想在 on_config_update
-# 里做配置迁移就失去了可比对的锚点。
-CONFIG_SCHEMA_VERSION = "1.3.0"
+CONFIG_SCHEMA_VERSION = "1.4.0"
 
 # 启动后探测关键词命中前的等待时间（秒）：表情库装载完成前提前探测会全部 miss。
 # 用 emoji.get_emotions 做「表情库是否就绪」的轮询门控——该 RPC 在表情库为空时
@@ -73,9 +65,9 @@ EMOJI_READY_POLL_INTERVAL_SECONDS = 1.5
 # 最大轮询次数：1.5s * 40 ≈ 60s，覆盖绝大多数冷启动；
 # 超过仍未就绪则放弃启动期探测，运行时再按需采样关键词（依然能工作）
 EMOJI_READY_POLL_MAX_ATTEMPTS = 40
-# 就绪后做 RPC 兜底探测的最大轮次（表情库已加载好后，一次 RPC 即可，留 1 次容错）
-EMOJI_PROBE_RPC_MAX_ATTEMPTS = 2
-EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS = 1.5
+# 就绪后做 RPC 兜底探测：表情库就绪后一次 RPC 即可——同一批关键词在 1~2 秒内
+# 不可能因为表情库变化而从 miss 变 hit，重试只是浪费 RPC 配额并延迟启动日志。
+EMOJI_PROBE_RPC_MAX_ATTEMPTS = 1
 
 # 选表情时按描述关键词探测的次数上限，避免关键词池很大时把所有 RPC 全打一遍。
 # 启动期 _probe_emoji_keywords 会把命中过的关键词记入 _validated_emoji_keywords，
@@ -101,6 +93,12 @@ STREAM_ID_CACHE_TTL_SECONDS = 1800.0
 # 绝大多数会在早期 return，但瞬时仍会堆积。超过该阈值后丢弃新任务（背压），
 # 避免极端流量下任务风暴拖累 Runner 调度。
 PROACTIVE_TASK_QUEUE_LIMIT = 64
+
+# send_poke 连续失败抑制窗口（秒）：风控 / 频控时 send_poke 会以 N 次回戳的节奏
+# 反复失败，warning 会瞬间刷屏并把同一份堆栈打几十遍。窗口内同一 label 的失败
+# 只打 1 条 warning，后续降级为 debug；窗口外重新允许一条 warning。
+# 拟人语义上，几秒~十几秒内重复打"调用异常"对运维并无新信息，留 debug 兜底足够。
+SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS = 15.0
 # 主动戳 self_id 的兜底：观察消息阶段拿不到 self_id 时，至少能从最近一次 notify.poke 事件里学到。
 # 模块级缓存让该信息跨多个聊天流共享，避免每个群独立踩坑。
 # 它只是个"软约束"——拿不到 self_id 也只是无法过滤掉麦麦自己发的消息，
@@ -149,7 +147,10 @@ class ReactionSection(PluginConfigBase):
         description="被戳时整体作出反应的概率",
         json_schema_extra={
             "label": "反应概率",
-            "hint": "0~1，越大越爱搭理",
+            "hint": (
+                "0~1，越大越爱搭理。注意：单类反应（回戳/表情/文字）的期望触发率 ≈ "
+                "react_probability × weight / sum(weights)，再被冷却与每分钟上限进一步削减"
+            ),
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -157,12 +158,13 @@ class ReactionSection(PluginConfigBase):
         },
     )
     back_poke_weight: float = Field(
-        default=0.4,
+        default=0.5,
         ge=0.0,
         le=1.0,
         description="反应时选择回戳的权重；三种权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "回戳权重",
+            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -176,6 +178,7 @@ class ReactionSection(PluginConfigBase):
         description="反应时选择发表情包的权重；三种权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "表情权重",
+            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -183,12 +186,13 @@ class ReactionSection(PluginConfigBase):
         },
     )
     text_weight: float = Field(
-        default=0.2,
+        default=0.1,
         ge=0.0,
         le=1.0,
         description="反应时选择文字回复的权重；三种权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "文字权重",
+            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -200,12 +204,12 @@ class ReactionSection(PluginConfigBase):
         ge=0.0,
         le=1.0,
         description=(
-            "react_probability 未命中时仍然挤一句 silent_replies 的概率。"
+            "react_probability 未命中时仍然挤一句沉默回复池的概率。"
             "意义上等价于「装看不见但偶尔抱怨一下」；命中后会消耗冷却，避免短时间内反复挤话"
         ),
         json_schema_extra={
             "label": "沉默时发言概率",
-            "hint": "未命中反应概率时，挤一句 silent_replies 的概率（会消耗冷却）",
+            "hint": "未命中反应概率时，挤一句沉默回复池的概率（会消耗冷却）",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -221,7 +225,7 @@ class ReactionSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "沉默时吞事件",
-            "hint": "False 时未反应的戳会照常传给主程序",
+            "hint": "关闭时未反应的戳会照常传给主程序",
         },
     )
 
@@ -274,7 +278,7 @@ class ReactionSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "回戳次数上限",
-            "hint": "默认 3 让暴戳态连戳两下；调到 1 退化为单次回戳，调到 3~5 更狠",
+            "hint": "默认 3 让暴戳态连戳两下；调到 1 退化为单次回戳，调到 4~5 更狠",
         },
     )
 
@@ -313,7 +317,7 @@ class FallbackSection(PluginConfigBase):
     normal_replies: list[str] = Field(
         default_factory=lambda: [
             "干嘛戳我",
-            "诶诶诶，戳什么戳",
+            "戳什么戳",
             "干啥",
         ],
         description="普通情况下的文字回复随机池",
@@ -537,7 +541,7 @@ class ProactiveSection(PluginConfigBase):
         json_schema_extra={"label": "全局冷却（秒）"},
     )
     max_pokes_per_day: int = Field(
-        default=30,
+        default=3,
         ge=0,
         le=1000,
         description="每天主动戳的次数上限（按本地日期归零，0 表示不限制）；超出后当天不再出手",
@@ -568,7 +572,7 @@ class ProactiveSection(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "拉取消息条数",
-            "hint": "建议保持与 lookback_seconds / recent_window_seconds 的预期密度匹配",
+            "hint": "建议保持与「候选活跃窗口」/「群活跃统计窗口」的预期密度匹配",
         },
     )
     min_recent_messages: int = Field(
@@ -584,10 +588,25 @@ class ProactiveSection(PluginConfigBase):
     respect_spam_history: bool = Field(
         default=True,
         description=(
-            "是否避开『最近戳过麦麦的用户』——开启后会跳过 spam_window_seconds 内戳过麦麦的人，"
-            "避免在用户刚戳完麦麦时立即反过去骚扰对方（容易显得报复性）"
+            "是否避开『最近戳过麦麦的用户』——开启后会跳过 respect_spam_window_seconds "
+            "窗口内戳过麦麦的人，避免在用户刚戳完麦麦时立即反过去骚扰对方（容易显得报复性）"
         ),
-        json_schema_extra={"label": "尊重 spam 历史"},
+        json_schema_extra={"label": "避开骚扰过麦麦的人"},
+    )
+    respect_spam_window_seconds: int = Field(
+        default=600,
+        ge=30,
+        le=86400,
+        description=(
+            "避开『戳过麦麦的人』时使用的回溯窗口（秒）。"
+            "与 reaction.spam_window_seconds（默认 45s，用于暴戳态判定）独立——"
+            "后者的窗口太短，不足以让对方『刚戳完麦麦立刻被反戳』显得不报复性；"
+            "默认 600 秒（10 分钟）让『避开』更保守一些"
+        ),
+        json_schema_extra={
+            "label": "避开戳过麦麦的窗口（秒）",
+            "hint": "推荐 300~1800；越长越保守，越短越容易反戳",
+        },
     )
     target_strategy: Literal["active_speaker", "random_recent"] = Field(
         default="active_speaker",
@@ -1056,9 +1075,19 @@ class SmartPokePlugin(MaiBotPlugin):
         # 避免高速消息流下同一群多个并发任务同时穿过冷却 → 双发。
         # 锁惰性创建；正常使用下群数量是常数，不主动清理（即使万级群也只占几 MB）。
         self._proactive_locks: dict[str, asyncio.Lock] = {}
+        # 主动戳全局 asyncio.Lock：per-group lock 只能防同群双发，
+        # 但全局冷却 (_last_proactive_global_at) 是跨群共享状态——
+        # 多个群并发任务在各自 per-group lock 内可同时通过 in_proactive_global_cooldown 检查，
+        # 双双 mark_proactive，导致 global_cooldown_seconds 被穿透。
+        # 用单独的全局锁把"全局冷却二次确认 + mark_proactive"包成原子，
+        # 锁持有时间极短（仅几行同步代码），不会阻塞其他群的 RPC 阶段。
+        self._proactive_global_lock: asyncio.Lock = asyncio.Lock()
         # 主动戳后台任务实时计数：_spawn_background_task 自带的 _pending_tasks 不区分 label，
         # 这里单独计数 proactive，便于按 PROACTIVE_TASK_QUEUE_LIMIT 背压。
         self._proactive_active_count: int = 0
+        # send_poke 失败抑制：按 label 记录最近一次"已打出 warning"的时间戳，
+        # 同 label 在 SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS 内的失败降级为 debug。
+        self._send_poke_failure_warned_at: dict[str, float] = {}
 
     # ===== 生命周期 =====
 
@@ -1241,33 +1270,26 @@ class SmartPokePlugin(MaiBotPlugin):
         if not remaining:
             return
 
-        for attempt in range(1, EMOJI_PROBE_RPC_MAX_ATTEMPTS + 1):
-            validated_this_round: list[str] = []
-            for kw in remaining:
-                try:
-                    emoji = await self.ctx.emoji.get_by_description(kw, limit=1)
-                except Exception:
-                    self.ctx.logger.debug(
-                        "emoji 关键词探测 RPC 失败 (kw=%s)", kw, exc_info=True
-                    )
-                    continue
-                if isinstance(emoji, dict) and emoji:
-                    validated_this_round.append(kw)
-            if validated_this_round:
-                for kw in validated_this_round:
-                    if kw not in self._validated_emoji_keywords:
-                        self._validated_emoji_keywords.append(kw)
-                self.ctx.logger.info(
-                    "emoji 关键词 RPC 探测追加命中 %d 个：%s",
-                    len(validated_this_round), ", ".join(validated_this_round),
-                )
-                return
-            if attempt < EMOJI_PROBE_RPC_MAX_ATTEMPTS:
+        validated_via_rpc: list[str] = []
+        for kw in remaining:
+            try:
+                emoji = await self.ctx.emoji.get_by_description(kw, limit=1)
+            except Exception:
                 self.ctx.logger.debug(
-                    "emoji 关键词 RPC 探测第 %d 轮全部未命中，%.1fs 后重试",
-                    attempt, EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS,
+                    "emoji 关键词探测 RPC 失败 (kw=%s)", kw, exc_info=True
                 )
-                await asyncio.sleep(EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS)
+                continue
+            if isinstance(emoji, dict) and emoji:
+                validated_via_rpc.append(kw)
+        if validated_via_rpc:
+            for kw in validated_via_rpc:
+                if kw not in self._validated_emoji_keywords:
+                    self._validated_emoji_keywords.append(kw)
+            self.ctx.logger.info(
+                "emoji 关键词 RPC 探测追加命中 %d 个：%s",
+                len(validated_via_rpc), ", ".join(validated_via_rpc),
+            )
+            return
 
         if not self._validated_emoji_keywords:
             self.ctx.logger.warning(
@@ -1329,19 +1351,11 @@ class SmartPokePlugin(MaiBotPlugin):
         if not ctx.is_group and not self.config.reaction.react_in_private:
             return None
 
-        # 冷却（按 cooldown_key + poker_id 维度：不同人独立冷却）
-        # 注意：冷却检查必须在 spam 计数之前，否则冷却期内的"无效戳"也会推动 spam 状态形成
-        if self._state.in_cooldown(
-            ctx.cooldown_key, ctx.poker_id, self.config.reaction.cooldown_seconds
-        ):
-            self.ctx.logger.debug(
-                "[%s:%s] 戳一戳冷却中，已拦截",
-                ctx.cooldown_key, ctx.poker_id,
-            )
-            return {"action": "abort"}
-
-        # 暴戳计数：通过黑名单/场景/冷却检查后才累计，避免在冷却期内被无声推进。
-        # 与反应概率解耦：即使本次因概率没命中没有动作，也会推动「被烦」状态形成。
+        # 暴戳计数：在冷却检查之前累计，让"被一直骚扰就进入被烦状态"语义稳定生效。
+        # 之前顺序是 cooldown → record，这会让 cooldown_seconds=8 + spam_threshold=5
+        # 的默认组合几乎无法触发——用户连戳被冷却全部拦截，spam 窗口里只能记到 1 次。
+        # 改为先 record：黑名单/场景拦截后才不计（已经决定彻底不理），冷却拦截仍计，
+        # 因为"对方依然在骚扰我"这件事和"我有没有反应"是两回事。
         # scope_key 用 spam_scope_key（群聊=group_id、私聊=poker_id），与 cooldown_key 解耦，
         # 确保 proactive 分支的 _poked_bot_recently(group_id) 能稳定查到记录。
         poke_count = self._state.record_poke_and_count(
@@ -1350,6 +1364,16 @@ class SmartPokePlugin(MaiBotPlugin):
             self.config.reaction.spam_window_seconds,
         )
         is_spam = poke_count >= self.config.reaction.spam_threshold
+
+        # 冷却（按 cooldown_key + poker_id 维度：不同人独立冷却）
+        if self._state.in_cooldown(
+            ctx.cooldown_key, ctx.poker_id, self.config.reaction.cooldown_seconds
+        ):
+            self.ctx.logger.debug(
+                "[%s:%s] 戳一戳冷却中，已拦截",
+                ctx.cooldown_key, ctx.poker_id,
+            )
+            return {"action": "abort"}
 
         # 滑动窗口频率限制：与逐人冷却互补——逐人冷却拦不住"10 个人轮番戳麦麦"，
         # 这里在通过冷却但即将进入反应分支前再做一道"过去 60 秒内总反应数"检查。
@@ -1421,14 +1445,10 @@ class SmartPokePlugin(MaiBotPlugin):
         if random.random() > cfg.probability:
             return False
 
-        # 选定跟风目标
+        # 选定跟风目标（_pick_bystander_target 内部已过滤黑名单，
+        # 因此 random 策略下选到黑名单成员时会自动尝试另一个；都被过滤则返回空）
         target_id = self._pick_bystander_target(ctx)
         if not target_id:
-            return False
-        # 黑名单仅决定"麦麦不主动戳此人"——
-        # 发起者 (poker) 在黑名单里也不阻止跟风戳被戳者的场景，
-        # 只在最终目标命中黑名单时跳过。
-        if target_id in self._blacklist:
             return False
 
         self._state.mark_bystander(bystander_key)
@@ -1440,14 +1460,28 @@ class SmartPokePlugin(MaiBotPlugin):
         return True
 
     def _pick_bystander_target(self, ctx: PokeContext) -> str:
-        """根据策略挑选要跟风戳的对象。"""
+        """根据策略挑选要跟风戳的对象；自动跳过黑名单成员。
+
+        - ``victim``：优先戳被戳者；若被戳者在黑名单则返回空（不退化到戳发起者，
+          保持策略语义清晰）。
+        - ``poker``：优先戳发起者；同上，黑名单则返回空。
+        - ``random``：两人候选随机洗牌后按顺序找第一个非黑名单的，
+          只要两人中至少一个不在黑名单就会成功，避免随机选到黑名单时整次出手浪费。
+        """
         strategy = self.config.bystander.target_strategy
         if strategy == "victim":
-            return ctx.target_id
-        if strategy == "poker":
-            return ctx.poker_id
-        # random
-        return random.choice([ctx.target_id, ctx.poker_id])
+            candidates = [ctx.target_id]
+        elif strategy == "poker":
+            candidates = [ctx.poker_id]
+        else:
+            # random：洗牌让两人机会均等
+            candidates = [ctx.target_id, ctx.poker_id]
+            random.shuffle(candidates)
+
+        for candidate in candidates:
+            if candidate and candidate not in self._blacklist:
+                return candidate
+        return ""
 
     async def _react_bystander(self, ctx: PokeContext, target_id: str) -> None:
         """跟风戳：延迟后给指定目标戳一下，纯戳不发文字。"""
@@ -1520,6 +1554,11 @@ class SmartPokePlugin(MaiBotPlugin):
           - 必须是真实文本消息，跳过通知事件（含 napcat notify.poke 自身），避免回声；
           - 说话人不能是麦麦自己 —— 通过 ``_last_known_self_id`` 兜底过滤；
           - 群 ID 必须是正整数；user_id 必须非空。
+
+        额外职责：从 napcat codec 注入的 ``additional_config.self_id`` 学习当前 bot 账号。
+        napcat 普通消息 codec 会把 ``self_id`` 塞进 ``additional_config``，让我们不必
+        等到第一次 notify.poke 才知道 self_id，避免冷启动期间麦麦自己的消息被算成
+        "群活跃"（_pick_proactive_target 用 self_id 过滤麦麦自己说的话）。
         """
         if not isinstance(message, dict):
             return None
@@ -1530,6 +1569,14 @@ class SmartPokePlugin(MaiBotPlugin):
         msg_info = message.get("message_info") or {}
         if not isinstance(msg_info, dict):
             return None
+
+        # 启动期 self_id 学习：napcat codec 把 self_id 塞进 additional_config，
+        # 普通消息也会带，比等 notify.poke 提前得多。
+        additional = msg_info.get("additional_config") or {}
+        if isinstance(additional, dict):
+            learned_self_id = str(additional.get("self_id") or "").strip()
+            if learned_self_id and learned_self_id != self._last_known_self_id:
+                self._last_known_self_id = learned_self_id
 
         group_info = msg_info.get("group_info") or {}
         if not isinstance(group_info, dict):
@@ -1575,10 +1622,15 @@ class SmartPokePlugin(MaiBotPlugin):
         在 OBSERVE handler 中以后台任务派发，所有耗时操作（昵称解析、最近消息回查、
         send_poke RPC）都在这里发生，避免拖慢主消息链。
 
-        关键设计：把"冷却检查 → 候选筛选 → mark_proactive"包进 per-group ``asyncio.Lock``，
-        保证同群多条消息并发触发时严格串行——第一个任务 mark 完后立刻设置冷却，
-        排队中的后续任务再次检查时会直接被冷却拒绝。延迟与 send_poke 留在锁外，
-        临界区只覆盖"决策与计数"，避免锁持有时间随网络延迟增长。
+        关键设计：双层锁结构
+        - 外层 per-group lock：保证同群多条消息并发触发时严格串行——
+          第一个任务 mark 完后立刻设置 chat 冷却，排队中的后续任务再次检查时被冷却拒绝。
+        - 内层全局 lock：仅保护"全局冷却二次确认 + mark_proactive"这段同步临界区，
+          防止不同群的并发任务在各自 per-group lock 内同时穿过 in_proactive_global_cooldown。
+          锁持有时间极短，不包含 RPC 调用。
+
+        RPC（resolve stream_id / message.get_recent）与延迟、send_poke 都在锁外或仅在
+        per-group lock 内，避免全局串行所有群的网络往返。
         """
         cfg = self.config.proactive
 
@@ -1599,8 +1651,10 @@ class SmartPokePlugin(MaiBotPlugin):
         target_id: str = ""
         target_name: str = ""
 
-        # ----- 锁内：冷却 / 日上限 / RPC / 候选筛选 / mark -----
+        # ----- per-group lock：决策与候选筛选 -----
         async with self._get_proactive_lock(group_id):
+            # 一次性轻量检查：全局/群冷却 + 日上限。这里全局冷却是"乐观快检"，
+            # 真正的原子性靠后续 _proactive_global_lock 内的二次确认保障。
             if self._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
                 return
             if self._state.in_proactive_chat_cooldown(group_id, cfg.per_chat_cooldown_seconds):
@@ -1638,8 +1692,18 @@ class SmartPokePlugin(MaiBotPlugin):
             if not target_id:
                 return
 
-            # 仍在锁内 → mark 把冷却/日计数推上去，让排队中的并发任务进入临界区时立即被冷却拒绝
-            self._state.mark_proactive(group_id, today)
+            # ----- 全局 lock：把"全局冷却二次确认 + mark"包成原子 -----
+            # RPC 期间其他群可能已经抢先 mark；这里必须再确认一次，
+            # 否则可能两个群在各自 per-group lock 内同时通过乐观快检后双双 mark。
+            async with self._proactive_global_lock:
+                if self._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
+                    return
+                # 日上限也复检一次：RPC 期间可能日上限刚好被其他群打满
+                if cfg.max_pokes_per_day > 0:
+                    already = self._state.proactive_daily_count(today)
+                    if already >= cfg.max_pokes_per_day:
+                        return
+                self._state.mark_proactive(group_id, today)
 
         # ----- 锁外：思考延迟 + 出手 -----
         lo = max(0.0, cfg.min_delay_seconds)
@@ -1764,9 +1828,14 @@ class SmartPokePlugin(MaiBotPlugin):
         return uid, uname, active_count
 
     def _poked_bot_recently(self, group_id: str, user_id: str) -> bool:
-        """是否在 spam 窗口内戳过麦麦：薄封装，让 _pick_proactive_target 调用点更直观。"""
+        """是否在 proactive.respect_spam_window_seconds 内戳过麦麦：薄封装。
+
+        注意窗口取自 ``proactive.respect_spam_window_seconds``，而不是
+        ``reaction.spam_window_seconds``——后者只用于暴戳态判定，太短不足以让
+        "避开报复性骚扰"显得克制。
+        """
         return self._state.poked_bot_recently(
-            group_id, user_id, self.config.reaction.spam_window_seconds
+            group_id, user_id, self.config.proactive.respect_spam_window_seconds
         )
 
     async def _resolve_stream_id_for_group(self, group_id: str) -> str:
@@ -1862,8 +1931,9 @@ class SmartPokePlugin(MaiBotPlugin):
     async def _silent_reply(self, ctx: PokeContext) -> None:
         """react_probability 未命中时按 silent_chat_probability 概率挤出的一句轻反应。
 
-        与正常反应分支不同：不参与反应类型抽样，只挑一句 silent_replies；
-        silent_replies 池为空时回落到 normal_replies，避免「想挤话却没词可挤」的尴尬。
+        与正常反应分支不同：不参与反应类型抽样，只挑一句 silent_replies。
+        ``silent_replies`` 池为空时直接放弃发送——尊重「用户清空就是想沉默」的语义，
+        不再回落到 normal_replies，避免「我特意删掉沉默池却仍在嘀咕普通回复」的反直觉。
 
         冷却由本函数内部在「确认能挤出一句话」后才消耗——先解析 stream_id 与回复池，
         都成立才标记冷却。这样 stream_id 解析失败 / 回复池为空时不会冷却用户，
@@ -1878,9 +1948,10 @@ class SmartPokePlugin(MaiBotPlugin):
                     ctx.group_id, ctx.poker_id,
                 )
                 return
-            pool = self.config.fallback.silent_replies or self.config.fallback.normal_replies
+            pool = self.config.fallback.silent_replies
             if not pool:
-                self.ctx.logger.debug("[silent_reply] silent / normal 回复池均为空，放弃发送")
+                # 用户主动清空 silent_replies 等价于「沉默就是沉默，连嘀咕也不要」
+                self.ctx.logger.debug("[silent_reply] silent 回复池为空，按沉默语义放弃发送")
                 return
             # 二次确认滑动窗口：handle_poke_event 派发本任务时窗口尚未满，
             # 但延迟期间可能被并发事件填满；mark 之前再 peek 一次保证总反应数严格不超上限。
@@ -1980,15 +2051,20 @@ class SmartPokePlugin(MaiBotPlugin):
         """按配置权重选择反应类型。返回 'poke' / 'emoji' / 'text'。
 
         三个权重独立配置，不要求加起来等于 1：取它们的总和后归一化分配。
-        暴戳时会削弱回戳和表情权重、抬高文字权重，让麦麦更倾向「嫌烦」地说话——
-        表情同样按 0.5 衰减，避免在「被烦」状态下还频繁发可爱表情造成违和。
+        暴戳态下按拟人语义重新分布：
+        - 回戳权重抬高（×1.5）：呼应"被烦了就连戳几下还回去"，一旦命中会触发
+          ``_send_back_poke`` 内的暴戳分支自动戳到 ``back_poke_max_times`` 上限。
+        - 表情权重大幅削弱（×0.3）：被烦了还发可爱表情明显违和。
+        - 文字权重略抬高（×1.2）：让"嘴硬抱怨"也有合理出现率，但不再主导分布。
+        归一化后，默认权重 (0.4/0.3/0.2) 在暴戳态下变为大约 0.6/0.09/0.24，
+        约 64% / 9% / 26% 的分布，回戳成为主反应方式。
         「真正沉默」由 handle_poke_event 中的 react_probability 未命中分支负责，
         与本方法的反应类型抽样无关。
         """
         cfg = self.config.reaction
-        spam_mult_poke = 0.5 if is_spam else 1.0
-        spam_mult_emoji = 0.5 if is_spam else 1.0
-        spam_mult_text = 1.5 if is_spam else 1.0
+        spam_mult_poke = 1.5 if is_spam else 1.0
+        spam_mult_emoji = 0.3 if is_spam else 1.0
+        spam_mult_text = 1.2 if is_spam else 1.0
         weights = {
             "poke": max(0.0, cfg.back_poke_weight * spam_mult_poke),
             "emoji": max(0.0, cfg.emoji_weight * spam_mult_emoji),
@@ -2007,6 +2083,26 @@ class SmartPokePlugin(MaiBotPlugin):
         return "text"
 
     # ===== 反应实现 =====
+
+    def _log_send_poke_failure(self, label: str, reason: str, *, exc: bool = False) -> None:
+        """同 label 的 send_poke 失败在 SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS 窗口内
+        只打一条 warning，避免风控/频控期间几十条相同栈刷屏。窗口内的后续失败降为 debug。
+
+        - ``label`` 已能区分 back_poke / bystander / proactive，多路径不会互相吞噬；
+        - ``exc=True`` 时把异常堆栈一起记录；
+        - 抑制窗口对 debug 不生效——开 DEBUG 调试时仍能看到每一次失败。
+        """
+        now = time.time()
+        last_warned = self._send_poke_failure_warned_at.get(label, 0.0)
+        if now - last_warned >= SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS:
+            self.ctx.logger.warning(
+                "[%s] send_poke %s", label, reason, exc_info=exc,
+            )
+            self._send_poke_failure_warned_at[label] = now
+        else:
+            self.ctx.logger.debug(
+                "[%s] send_poke %s（已被抑制窗口降级）", label, reason, exc_info=exc,
+            )
 
     async def _invoke_send_poke(
         self,
@@ -2040,11 +2136,16 @@ class SmartPokePlugin(MaiBotPlugin):
             resp = await self.ctx.api.call(
                 "adapter.napcat.message.send_poke", **call_kwargs
             )
+            # 宿主层在 RPC 无响应 / 反序列化失败时会返回 None；这种情况下没法判断
+            # NapCat 是否真的接到了请求，按"未成功"处理更稳妥，让上层走兜底路径。
+            if resp is None:
+                self._log_send_poke_failure(label, "send_poke 无响应 (resp=None)")
+                return False
             if isinstance(resp, dict):
                 # 宿主层 RPC 失败：resp = {"success": False, "error": "..."}
                 if resp.get("success") is False:
-                    self.ctx.logger.warning(
-                        "[%s] send_poke 宿主调用失败: %s", label, resp.get("error")
+                    self._log_send_poke_failure(
+                        label, f"宿主调用失败: {resp.get('error')}"
                     )
                     return False
                 # NapCat 业务级失败：resp 直接是 NapCat 原始响应，含 status / retcode
@@ -2053,19 +2154,17 @@ class SmartPokePlugin(MaiBotPlugin):
                 if (status and status not in ("ok", "async")) or (
                     isinstance(retcode, int) and retcode != 0
                 ):
-                    self.ctx.logger.warning(
-                        "[%s] send_poke NapCat 业务失败: status=%s retcode=%s message=%s",
+                    self._log_send_poke_failure(
                         label,
-                        status or "<none>",
-                        retcode,
-                        resp.get("message") or resp.get("wording"),
+                        f"NapCat 业务失败: status={status or '<none>'} retcode={retcode} "
+                        f"message={resp.get('message') or resp.get('wording')}",
                     )
                     return False
             return True
         except Exception:
             # 风控 / 频率限制场景下 send_poke 会反复失败，stack trace 会刷屏，
-            # 用 warning + exc_info 让用户按需开 DEBUG 看完整堆栈即可。
-            self.ctx.logger.warning("[%s] send_poke 调用异常", label, exc_info=True)
+            # 抑制窗口内只打 debug，让用户按需开 DEBUG 看完整堆栈即可。
+            self._log_send_poke_failure(label, "调用异常", exc=True)
             return False
 
     async def _send_back_poke(self, ctx: PokeContext, is_spam: bool = False) -> bool:
@@ -2116,17 +2215,22 @@ class SmartPokePlugin(MaiBotPlugin):
     async def _send_text(self, stream_id: str, is_spam: bool) -> bool:
         """从配置的回复池中随机挑一句文字发出。
 
-        池回落链：暴戳态先 spam_replies；不论是不是暴戳，spam/normal 都空时回落到 silent_replies。
-        这样用户清空 spam_replies 也不会出现『抽中 text 却什么都没发』的失声观感。
+        池回落链：
+        - 暴戳态：spam_replies → normal_replies；**不再回落到 silent_replies**——
+          暴戳态下蹦个 "..." 反差太大，会破坏"被烦了语气更冲"的人设；
+          若前两档全空，就让 _react 走兜底回戳更合适。
+        - 普通态：normal_replies → silent_replies——普通态偶尔嘀咕一句没有违和感。
+
         返回是否成功投递，便于上层做兜底回戳。
         """
         if is_spam:
             primary = self.config.fallback.spam_replies
             secondary = self.config.fallback.normal_replies
+            tertiary: list[str] = []  # 暴戳态不兜到 silent，让外层走回戳
         else:
             primary = self.config.fallback.normal_replies
             secondary: list[str] = []
-        tertiary = self.config.fallback.silent_replies
+            tertiary = self.config.fallback.silent_replies
 
         for pool, label in ((primary, "primary"), (secondary, "secondary"), (tertiary, "silent")):
             if pool:
