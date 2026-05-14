@@ -63,11 +63,19 @@ PLUGIN_VERSION = _load_manifest_version()
 CONFIG_SCHEMA_VERSION = "1.3.0"
 
 # 启动后探测关键词命中前的等待时间（秒）：表情库装载完成前提前探测会全部 miss。
-# 改为「先短等一次，未命中则按 EMOJI_PROBE_RETRY_INTERVAL 重试 EMOJI_PROBE_MAX_ATTEMPTS 次」，
-# 避免冷启动慢的部署里固定 5 秒还赶不上、或冷启动快时白等 5 秒。
+# 用 emoji.get_emotions 做「表情库是否就绪」的轮询门控——该 RPC 在表情库为空时
+# 只是返回空列表（success=True），不会触发主程序 emoji_manager 的
+# "[获取表情包] 表情包列表为空" warning；而 get_by_description 在表情库为空时
+# 会在主程序里打出该 warning，必须等就绪后再调用。
 EMOJI_PROBE_INITIAL_DELAY_SECONDS = 2.0
-EMOJI_PROBE_RETRY_INTERVAL_SECONDS = 2.0
-EMOJI_PROBE_MAX_ATTEMPTS = 3
+# 表情库就绪轮询：未就绪时按该间隔继续轮询 get_emotions，直到拿到非空 emotion 列表
+EMOJI_READY_POLL_INTERVAL_SECONDS = 1.5
+# 最大轮询次数：1.5s * 40 ≈ 60s，覆盖绝大多数冷启动；
+# 超过仍未就绪则放弃启动期探测，运行时再按需采样关键词（依然能工作）
+EMOJI_READY_POLL_MAX_ATTEMPTS = 40
+# 就绪后做 RPC 兜底探测的最大轮次（表情库已加载好后，一次 RPC 即可，留 1 次容错）
+EMOJI_PROBE_RPC_MAX_ATTEMPTS = 2
+EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS = 1.5
 
 # 选表情时按描述关键词探测的次数上限，避免关键词池很大时把所有 RPC 全打一遍。
 # 启动期 _probe_emoji_keywords 会把命中过的关键词记入 _validated_emoji_keywords，
@@ -1077,7 +1085,7 @@ class SmartPokePlugin(MaiBotPlugin):
     ) -> None:
         if scope == "self":
             self._refresh_user_sets()
-            self.ctx.logger.info("配置已热更新到 v%s。", version)
+            self.ctx.logger.info("配置已热更新完成。")
 
     def _refresh_user_sets(self) -> None:
         """把配置中的黑名单 / 主动戳群白名单 / 黑名单归一化成字符串集合，便于 O(1) 查询。"""
@@ -1162,17 +1170,20 @@ class SmartPokePlugin(MaiBotPlugin):
     async def _probe_emoji_keywords(self) -> None:
         """启动后试探一次按关键词搜表情，记录命中关键词到验证集。
 
-        分两步：
-        1. 先调一次 ``emoji.get_emotions()`` 拿到全量 emotion 标签集合，与配置关键词做
-           子串双向匹配——既能命中"关键词等于标签"，也能命中"标签包含关键词"或
-           "关键词包含标签"。本地命中的关键词直接进验证集，零 RPC 开销。
-        2. 仅对本地未匹配的关键词再走 ``emoji.get_by_description`` 兜底探测；
-           启动期表情库可能尚未装载完毕，使用"短延迟 + 重试"策略，
-           每轮 ``EMOJI_PROBE_MAX_ATTEMPTS`` 次，发现至少一个命中即停止。
+        关键约束：必须等主程序的表情库（emoji_manager.emojis）加载完成后才能调用
+        ``emoji.get_by_description``。否则主程序内部在 emoji 列表为空时会打出
+        "[获取表情包] 表情包列表为空" warning，启动期会被刷屏。
 
-        SDK 对 ``emoji.get_by_description`` 与 ``emoji.get_emotions`` 的语义并不保证
-        完全同集合：前者按描述模糊搜，后者只返回 emotion 标签。这里把"本地匹配"
-        作为快速命中通道，把"逐个 RPC 探测"作为完整兜底，两条路径互补。
+        因此分三步：
+        1. 用 ``emoji.get_emotions()`` 轮询「表情库是否就绪」——该 RPC 表情库为空时
+           只是返回空列表（success=True），不会触发主程序 warning，是无副作用的就绪信号；
+        2. 拿到非空 emotion 列表后，本地做关键词与 emotion 标签的双向子串匹配，
+           本地命中的关键词直接进验证集，零额外 RPC；
+        3. 仅对本地未命中的关键词再走 ``emoji.get_by_description`` 兜底探测——
+           此时表情库已就绪，不再有 warning 风险，命中率也明显更高。
+
+        若轮询超出 ``EMOJI_READY_POLL_MAX_ATTEMPTS`` 仍未就绪，则放弃启动期探测，
+        运行时 ``_pick_emoji`` 仍会按需采样关键词工作，只是命中率不如启动期预热过。
         """
         keywords = [str(k).strip() for k in self.config.emoji.description_keywords if str(k).strip()]
         if not keywords:
@@ -1180,35 +1191,57 @@ class SmartPokePlugin(MaiBotPlugin):
 
         await asyncio.sleep(EMOJI_PROBE_INITIAL_DELAY_SECONDS)
 
-        # 步骤 1：通过 get_emotions 一次性拿到 emotion 标签集做本地匹配
-        prevalidated: list[str] = []
-        try:
-            emotions = await self.ctx.emoji.get_emotions()
-        except Exception:
-            self.ctx.logger.debug("emoji.get_emotions 调用失败，将退化到逐关键词探测", exc_info=True)
-            emotions = None
-        if isinstance(emotions, list) and emotions:
-            emotion_set = {str(e).strip() for e in emotions if str(e).strip()}
-            for kw in keywords:
-                # 双向子串匹配：kw 直接是标签，或被标签包含，或包含某个标签
-                if any(kw == e or kw in e or e in kw for e in emotion_set):
-                    prevalidated.append(kw)
-            if prevalidated:
-                # 与步骤 2 的 extend + 去重一致，避免未来引入持久化验证集时被启动探测覆盖
-                for kw in prevalidated:
-                    if kw not in self._validated_emoji_keywords:
-                        self._validated_emoji_keywords.append(kw)
-                self.ctx.logger.info(
-                    "emoji.get_emotions 本地匹配命中 %d/%d 个关键词：%s",
-                    len(prevalidated), len(keywords), ", ".join(prevalidated),
+        # 步骤 1：轮询 get_emotions 直到表情库就绪（返回非空列表）
+        emotions: list[Any] = []
+        for attempt in range(1, EMOJI_READY_POLL_MAX_ATTEMPTS + 1):
+            try:
+                result = await self.ctx.emoji.get_emotions()
+            except Exception:
+                self.ctx.logger.debug(
+                    "emoji.get_emotions 第 %d 次调用失败", attempt, exc_info=True,
                 )
+                result = None
+            if isinstance(result, list) and result:
+                emotions = result
+                if attempt > 1:
+                    self.ctx.logger.debug(
+                        "表情库在第 %d 次轮询时就绪（%d 个 emotion 标签）",
+                        attempt, len(emotions),
+                    )
+                break
+            # 表情库尚未加载完成（返回空列表 / None / 异常）：继续轮询
+            if attempt < EMOJI_READY_POLL_MAX_ATTEMPTS:
+                await asyncio.sleep(EMOJI_READY_POLL_INTERVAL_SECONDS)
+        else:
+            self.ctx.logger.info(
+                "等待表情库就绪超时（轮询 %d 次仍未拿到 emotion 标签），跳过启动期关键词探测；"
+                "运行时仍会按需采样关键词调用 emoji RPC",
+                EMOJI_READY_POLL_MAX_ATTEMPTS,
+            )
+            return
 
-        # 步骤 2：未本地命中的关键词走 RPC 兜底；若已全部命中则直接结束
+        # 步骤 2：拿到 emotion 标签集后本地匹配
+        emotion_set = {str(e).strip() for e in emotions if str(e).strip()}
+        prevalidated: list[str] = []
+        for kw in keywords:
+            # 双向子串匹配：kw 直接是标签，或被标签包含，或包含某个标签
+            if any(kw == e or kw in e or e in kw for e in emotion_set):
+                prevalidated.append(kw)
+        if prevalidated:
+            for kw in prevalidated:
+                if kw not in self._validated_emoji_keywords:
+                    self._validated_emoji_keywords.append(kw)
+            self.ctx.logger.info(
+                "emoji.get_emotions 本地匹配命中 %d/%d 个关键词：%s",
+                len(prevalidated), len(keywords), ", ".join(prevalidated),
+            )
+
+        # 步骤 3：本地未匹配的关键词走 RPC 兜底；若已全部命中则直接结束
         remaining = [kw for kw in keywords if kw not in prevalidated]
         if not remaining:
             return
 
-        for attempt in range(1, EMOJI_PROBE_MAX_ATTEMPTS + 1):
+        for attempt in range(1, EMOJI_PROBE_RPC_MAX_ATTEMPTS + 1):
             validated_this_round: list[str] = []
             for kw in remaining:
                 try:
@@ -1229,12 +1262,12 @@ class SmartPokePlugin(MaiBotPlugin):
                     len(validated_this_round), ", ".join(validated_this_round),
                 )
                 return
-            if attempt < EMOJI_PROBE_MAX_ATTEMPTS:
+            if attempt < EMOJI_PROBE_RPC_MAX_ATTEMPTS:
                 self.ctx.logger.debug(
-                    "emoji 关键词探测第 %d 轮全部未命中，%.1fs 后重试",
-                    attempt, EMOJI_PROBE_RETRY_INTERVAL_SECONDS,
+                    "emoji 关键词 RPC 探测第 %d 轮全部未命中，%.1fs 后重试",
+                    attempt, EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS,
                 )
-                await asyncio.sleep(EMOJI_PROBE_RETRY_INTERVAL_SECONDS)
+                await asyncio.sleep(EMOJI_PROBE_RPC_RETRY_INTERVAL_SECONDS)
 
         if not self._validated_emoji_keywords:
             self.ctx.logger.warning(
