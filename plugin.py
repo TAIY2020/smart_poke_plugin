@@ -1,18 +1,8 @@
 """智能戳一戳插件 — MaiBot SDK v2
 
-监听 QQ 戳一戳事件：
-- 戳麦麦本人时按概率作出回戳 / 文字 / 表情 / 沉默反应。
-- 别人之间互戳时，麦麦也可按概率「跟风」戳一下（目标可配置为被戳者 / 发起者 / 随机）。
-
-实现要点：
-    依赖 MaiBot-Napcat-Adapter 注入的 notice 事件。当 napcat 收到
-    notify.poke 事件时，会把 payload 透传到消息 dict 的
-    message_info.additional_config 中（napcat_notice_type=notify、
-    napcat_notice_sub_type=poke、napcat_notice_payload=<原始 payload>）。
-    本插件通过 @HookHandler 订阅 chat.receive.before_process，
-    在该 Hook 中识别戳一戳事件，分两种情况：
-      - 戳麦麦本人 → 拦截事件 + 异步触发反应任务
-      - 戳别人 → 不拦截事件，仅按概率异步触发跟风戳任务
+通过 @HookHandler 订阅 chat.receive.before_process，识别 napcat 适配器
+注入的 notify.poke 事件，按拟人化策略回戳 / 发文字 / 发表情 / 沉默；
+另以 OBSERVE 模式观察普通消息，按概率触发主动戳。
 """
 
 from __future__ import annotations
@@ -52,57 +42,32 @@ def _load_manifest_version() -> str:
 
 PLUGIN_VERSION = _load_manifest_version()
 
-CONFIG_SCHEMA_VERSION = "1.4.0"
+CONFIG_SCHEMA_VERSION = "1.5.0"
 
-# 启动后探测关键词命中前的等待时间（秒）：表情库装载完成前提前探测会全部 miss。
-# 用 emoji.get_emotions 做「表情库是否就绪」的轮询门控——该 RPC 在表情库为空时
-# 只是返回空列表（success=True），不会触发主程序 emoji_manager 的
-# "[获取表情包] 表情包列表为空" warning；而 get_by_description 在表情库为空时
-# 会在主程序里打出该 warning，必须等就绪后再调用。
+# 表情库未就绪时 get_by_description 会在主程序里打 "[获取表情包] 表情包列表为空" warning，
+# 必须先用无副作用的 get_emotions 轮询确认就绪后再发 RPC。
 EMOJI_PROBE_INITIAL_DELAY_SECONDS = 2.0
-# 表情库就绪轮询：未就绪时按该间隔继续轮询 get_emotions，直到拿到非空 emotion 列表
 EMOJI_READY_POLL_INTERVAL_SECONDS = 1.5
-# 最大轮询次数：1.5s * 40 ≈ 60s，覆盖绝大多数冷启动；
-# 超过仍未就绪则放弃启动期探测，运行时再按需采样关键词（依然能工作）
 EMOJI_READY_POLL_MAX_ATTEMPTS = 40
-# 就绪后做 RPC 兜底探测：表情库就绪后一次 RPC 即可——同一批关键词在 1~2 秒内
-# 不可能因为表情库变化而从 miss 变 hit，重试只是浪费 RPC 配额并延迟启动日志。
 EMOJI_PROBE_RPC_MAX_ATTEMPTS = 1
 
-# 选表情时按描述关键词探测的次数上限，避免关键词池很大时把所有 RPC 全打一遍。
-# 启动期 _probe_emoji_keywords 会把命中过的关键词记入 _validated_emoji_keywords，
-# 运行时优先采样这些已验证关键词，让 LIMIT 内的 RPC 命中率显著提高。
 EMOJI_KEYWORD_PROBE_LIMIT = 3
 
-# 已验证表情关键词的连续 miss 阈值：达到该次数后自动从验证集中移除，
-# 应对「表情库后续被删除导致曾经命中的关键词再也查不到」的场景，
-# 避免每次反应都白白把 RPC 配额消耗在已经失效的关键词上。
+# 已验证关键词连续 miss 阈值：达到后从验证集移除，应对"表情库后续被删"场景。
 EMOJI_KEYWORD_MISS_THRESHOLD = 3
 
-# 昵称缓存 TTL（秒）与容量上限：群里同一用户在短时间内被反复戳，避免重复 RPC
 MEMBER_NAME_CACHE_TTL_SECONDS = 600.0
 MEMBER_NAME_CACHE_MAX_SIZE = 256
-# 昵称解析失败的负缓存 TTL：避免连戳同一无昵称用户时反复打 RPC
 MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS = 60.0
 
-# stream_id 回查缓存 TTL：notice 消息的 session_id 固定为空，每次反应都得回查；
-# stream_id 在 Host 端基本稳定，可以长一点
+# notice 消息 session_id 固定为空，stream_id 每次反应都得回查，缓存收益明显。
 STREAM_ID_CACHE_TTL_SECONDS = 1800.0
 
-# 主动戳后台任务并发上限：群高速刷屏时 OBSERVE 每条都派发一次任务，
-# 绝大多数会在早期 return，但瞬时仍会堆积。超过该阈值后丢弃新任务（背压），
-# 避免极端流量下任务风暴拖累 Runner 调度。
+# 主动戳后台任务并发上限：群高速刷屏时按背压丢弃新任务，避免任务风暴。
 PROACTIVE_TASK_QUEUE_LIMIT = 64
 
-# send_poke 连续失败抑制窗口（秒）：风控 / 频控时 send_poke 会以 N 次回戳的节奏
-# 反复失败，warning 会瞬间刷屏并把同一份堆栈打几十遍。窗口内同一 label 的失败
-# 只打 1 条 warning，后续降级为 debug；窗口外重新允许一条 warning。
-# 拟人语义上，几秒~十几秒内重复打"调用异常"对运维并无新信息，留 debug 兜底足够。
+# send_poke 失败抑制窗口：风控/频控时同 label 的 warning 只打一条，其余降级为 debug。
 SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS = 15.0
-# 主动戳 self_id 的兜底：观察消息阶段拿不到 self_id 时，至少能从最近一次 notify.poke 事件里学到。
-# 模块级缓存让该信息跨多个聊天流共享，避免每个群独立踩坑。
-# 它只是个"软约束"——拿不到 self_id 也只是无法过滤掉麦麦自己发的消息，
-# 不会造成功能性 bug（麦麦自己发消息也走 send.* 出站，理论上不会再被 receive Hook 接到）。
 
 
 # --- 配置模型 ---
@@ -685,12 +650,7 @@ class SmartPokeConfig(PluginConfigBase):
 
 
 class PokeContext:
-    """从一次戳一戳事件中提取出的关键信息。
-
-    ``_extract_poke_context`` 在识别失败时直接返回 ``None``，因此一旦构造出
-    ``PokeContext`` 实例，里面的字段一定是「成功识别」的状态。是否戳麦麦本人
-    由 ``is_poking_bot`` 派生计算，不再单独存字段。
-    """
+    """从一次戳一戳事件中提取出的关键信息。"""
 
     __slots__ = (
         "is_group",
@@ -714,59 +674,41 @@ class PokeContext:
         self.target_name: str = ""
         self.group_id: str = ""
         self.stream_id: str = ""
-        # napcat 注入的 notice 消息 session_id 常为空，需要按 stream_id → group_id → poker_id 回退
+        # napcat notice 的 session_id 常为空，按 stream_id → group_id → poker_id 回退
         self.cooldown_key: str = ""
-        # 暴戳计数专用 scope：群聊固定用 group_id、私聊固定用 poker_id。
-        # 与 cooldown_key 解耦的原因：proactive 分支查询 _poked_bot_recently 时只能传
-        # group_id，必须与 record 端用同一个 scope 才能匹配；不能依赖
-        # "napcat notice 的 session_id 永远为空" 这种上游隐式事实。
+        # 与 cooldown_key 解耦：proactive 分支查 _poked_bot_recently 只能传 group_id，
+        # 必须与 record 端用同一个 scope 才能匹配
         self.spam_scope_key: str = ""
 
     @property
     def is_poking_bot(self) -> bool:
-        """目标是否为麦麦本人。"""
         return bool(self.self_id) and self.target_id == self.self_id
 
 
 class PokeStateManager:
-    """每个插件实例独立持有的状态：冷却时间戳与每用户戳次数窗口。
-
-    设计要点：
-    - 戳麦麦冷却按 ``scope_key:poker_id`` 维度计：不同人独立冷却，A 触发冷却不阻挡 B。
-    - 跟风戳冷却按 ``scope_key`` 维度计：避免麦麦在群里跟风刷屏。
-    - 暴戳计数同样按 ``scope_key:poker_id`` 维度，与戳麦麦冷却一致。
-    - ``scope_key`` 由调用方决定（stream_id → group_id → poker_id 回退），
-      避免 napcat 注入的 notice 消息 session_id 为空时冷却完全失效。
-    - 暴戳窗口用 ``deque`` 存时间戳，popleft 把过期项整体移出，避免每次戳重建 list。
-    - 字典 key 不会自动消失，因此在 record_poke_and_count 中按计数触发 _prune。
-    """
+    """冷却时间戳、暴戳计数、各种 TTL 缓存的集中持有者。"""
 
     _PRUNE_THRESHOLD = 200
     _STALE_AFTER_SECONDS = 3600
+    # 单条暴戳计数 deque 的硬上限——暴戳判定只关心 >= spam_threshold，多余的旧记录
+    # 会被天然挤出而不影响判定结果。
+    _POKE_RECORD_MAXLEN = 200
 
     def __init__(self) -> None:
         self._last_react_at: dict[str, float] = {}
-        self._poke_records: dict[str, deque[float]] = defaultdict(deque)
+        self._poke_records: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN)
+        )
         self._last_bystander_at: dict[str, float] = {}
         self._record_counter: int = 0
-        # 戳麦麦反应的滑动窗口：所有"真的反应了"（mark_reacted 调用）的时间戳，
-        # 用于实现"过去 N 秒内反应总数上限"。与逐人冷却互补——
-        # 后者防同一人短时刷屏，前者防多人轮番车轮战。
-        # 跟风戳 / 主动戳不占用这个窗口，因为它们已有各自的冷却 + 日上限。
+        # 反应总数滑动窗口：与逐人冷却互补，防多人轮番车轮战；
+        # 跟风戳/主动戳有各自的冷却+日上限，不占用此窗口。
         self._reaction_window: deque[float] = deque()
-        # 昵称缓存：key = "group_id:user_id" 或 "user_id"；value = (nickname, expire_at)。
-        # 允许 nickname 为空串，表示「已知该用户没有可解析的昵称」的负缓存条目。
+        # name=""为负缓存条目（已知该用户没有可解析昵称），TTL 配更短。
         self._name_cache: dict[str, tuple[str, float]] = {}
-        # stream_id 回查缓存：notice 消息的 session_id 固定为空，每次反应都得回查。
-        # key = "group:{id}" / "user:{id}"；value = (stream_id, expire_at)。
         self._stream_id_cache: dict[str, tuple[str, float]] = {}
-        # 主动戳：每群最近一次出手时间（按 group_id 维度，不带 user_id —— 主动戳的冷却约束的是
-        # "这个群被骚扰的密度"，而不是"某个具体用户在这个群里多久没被戳过"）
         self._last_proactive_at_chat: dict[str, float] = {}
-        # 主动戳：全局最近一次出手时间。避免在多个群间无间隔连续戳，"撒野"感太重
         self._last_proactive_global_at: float = 0.0
-        # 主动戳：当日次数 + 日期标签。日期变化时归零；这里用本地日期串，
-        # 与配置项 active_hour_start/end 的"本地时间"语义保持一致
         self._proactive_daily_count: int = 0
         self._proactive_daily_date: str = ""
 
@@ -788,16 +730,10 @@ class PokeStateManager:
         now = time.time()
         if key:
             self._last_react_at[key] = now
-        # 同时把本次反应推进滑动窗口；调用方不需要单独 push。
-        # silent_reply 也走这个方法，所以"挤一句话"也会占一个窗口槽，与拟人语义一致。
         self._reaction_window.append(now)
 
     def peek_reaction_window(self, window_seconds: int) -> int:
-        """只读式查询：窗口内当前累计反应数（顺便清理过期记录）。
-
-        与 ``record_*_and_count`` 不同：本方法不写入新记录，仅用于"检查是否超限"。
-        真正的"记录一次反应"由 ``mark_reacted`` 内部 push 完成，避免重复计数。
-        """
+        """返回窗口内累计反应数，顺便清理过期记录。不写入新记录。"""
         if window_seconds <= 0:
             return 0
         cutoff = time.time() - window_seconds
@@ -855,17 +791,12 @@ class PokeStateManager:
         return name
 
     def cache_name(self, group_id: str, user_id: str, name: str, ttl: float) -> None:
-        """缓存昵称查询结果。
-
-        ``name`` 允许为空串：表示「已查询过但该用户没有可用昵称」的负缓存条目，
-        避免连戳同一无昵称用户时反复打 RPC。负缓存通常配更短的 TTL。
-        """
+        """缓存昵称查询结果；``name`` 为空串表示负缓存（已知该用户没有可用昵称）。"""
         if not user_id:
             return
         key = self._name_cache_key(group_id, user_id)
         self._name_cache[key] = (name, time.time() + ttl)
         if len(self._name_cache) > MEMBER_NAME_CACHE_MAX_SIZE:
-            # 超过容量上限时，丢弃已过期或最早过期的一半，保持复杂度可控
             now = time.time()
             kept = sorted(
                 ((k, v) for k, v in self._name_cache.items() if v[1] >= now),
@@ -898,7 +829,6 @@ class PokeStateManager:
     def cache_stream_id(
         self, *, group_id: str, user_id: str, stream_id: str, ttl: float
     ) -> None:
-        """缓存 stream_id 回查结果。``stream_id`` 为空串时不缓存（避免污染）。"""
         if not stream_id:
             return
         key = self._stream_cache_key(group_id=group_id, user_id=user_id)
@@ -920,11 +850,7 @@ class PokeStateManager:
         return (time.time() - self._last_proactive_global_at) < cooldown_seconds
 
     def mark_proactive(self, group_id: str, today: str) -> None:
-        """记录一次主动戳：刷新群冷却 + 全局冷却 + 日计数。
-
-        ``today`` 由调用方按本地日期生成（``time.strftime('%Y-%m-%d')``），
-        让"日切归零"语义与配置项 ``active_hour_*`` 的本地时间口径一致。
-        """
+        """``today`` 由调用方按本地日期生成，保持与 active_hour_* 的口径一致。"""
         now = time.time()
         if group_id:
             self._last_proactive_at_chat[group_id] = now
@@ -935,7 +861,6 @@ class PokeStateManager:
         self._proactive_daily_count += 1
 
     def proactive_daily_count(self, today: str) -> int:
-        """返回当前『今天』的主动戳计数；日期变化时返回 0（但不主动清零，等下次 mark 时清）。"""
         if today != self._proactive_daily_date:
             return 0
         return self._proactive_daily_count
@@ -945,10 +870,7 @@ class PokeStateManager:
     ) -> bool:
         """``user_id`` 是否在 ``window_seconds`` 内于 ``scope_key`` 维度戳过麦麦。
 
-        复用主分支累计的 _poke_records（戳麦麦事件累计起来的窗口记录），
-        让主动戳能尊重「对方刚戳过麦麦」的记忆，避免立即反过去骚扰对方。
-        - ``scope_key`` 与主 Hook 保持一致：群聊场景下用 group_id；
-        - 任一参数缺失或窗口非正都视为「没戳过」，调用方据此跳过过滤。
+        ``scope_key`` 必须与主 Hook record 端用同一维度（群聊场景下用 group_id）才能命中。
         """
         if not scope_key or not user_id or window_seconds <= 0:
             return False
@@ -967,15 +889,11 @@ class PokeStateManager:
             k: v for k, v in self._last_proactive_at_chat.items() if v >= cutoff
         }
         self._poke_records = defaultdict(
-            deque,
+            lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN),
             {k: v for k, v in self._poke_records.items() if v and v[-1] >= cutoff},
         )
-        # 反应滑动窗口：清掉 _STALE_AFTER_SECONDS 之前的陈旧记录。
-        # peek_reaction_window 已经会按调用方传入的窗口长度清理，但很少触发反应的部署里
-        # 窗口可能长时间不被读，借 _prune 兜一下避免内存悄悄涨。
         while self._reaction_window and self._reaction_window[0] < cutoff:
             self._reaction_window.popleft()
-        # 昵称缓存与 stream_id 缓存按自身过期时间清理
         now = time.time()
         self._name_cache = {k: v for k, v in self._name_cache.items() if v[1] >= now}
         self._stream_id_cache = {k: v for k, v in self._stream_id_cache.items() if v[1] >= now}
@@ -998,7 +916,6 @@ class PokeStateManager:
 
 
 def _to_positive_int(value: Any) -> int | None:
-    """把任意输入安全转成正整数，失败返回 None。"""
     try:
         text = str(value).strip()
         if not text:
@@ -1014,13 +931,12 @@ def _to_positive_int(value: Any) -> int | None:
 def _in_active_hours(start: int, end: int, now_hour: int) -> bool:
     """判断当前小时是否落在 [start, end) 活跃区间内（本地时间，24h 制）。
 
-    - ``start == end``：视为「全天活跃」，便于用户禁用时段限制时只填同一个值；
-    - ``start < end``：普通区间，例如 9 ~ 24 表示早 9 到晚 24（即跨整个白天）；
-    - ``start > end``：跨午夜区间，例如 22 ~ 2 表示晚 22 到次日 2 点。
+    - ``start == end``：全天活跃；
+    - ``start < end``：普通区间；
+    - ``start > end``：跨午夜区间（如 22 ~ 2 表示晚 22 到次日 2 点）。
 
-    end 是开区间，与 Python ``range`` 一致，避免「24:00 算不算」的歧义。
-    特别地，``end == 24`` 不做 ``% 24`` 归一化——这样默认配置 ``start=9, end=24``
-    才能正确表达「从早 9 点直到午夜」，否则 24 → 0 后会被误判成跨午夜区间。
+    ``end == 24`` 不做 ``% 24`` 归一化——否则默认配置 ``start=9, end=24``
+    会被误判成跨午夜区间。
     """
     start = start % 24
     end_normalized = end if end == 24 else end % 24
@@ -1032,7 +948,6 @@ def _in_active_hours(start: int, end: int, now_hour: int) -> bool:
 
 
 def _format_local_date(timestamp: float) -> str:
-    """按本地时区把 UNIX 时间戳格式化成 ``YYYY-MM-DD``，用于主动戳的日切判断。"""
     return time.strftime("%Y-%m-%d", time.localtime(timestamp))
 
 
@@ -1040,14 +955,7 @@ def _format_local_date(timestamp: float) -> str:
 
 
 class SmartPokePlugin(MaiBotPlugin):
-    """智能戳一戳插件主类。
-
-    工作流程：
-        1. 收到 chat.receive.before_process Hook。
-        2. 从 message.message_info.additional_config 判断是否 napcat 的 notify.poke 事件。
-        3. 只在 target_id == self_id（戳麦麦本人）时拦截事件并触发反应。
-        4. 异步任务按概率执行回戳 / 文字 / 表情 / 沉默。
-    """
+    """智能戳一戳插件主类。"""
 
     config_model = SmartPokeConfig
 
@@ -1056,49 +964,39 @@ class SmartPokePlugin(MaiBotPlugin):
         self._blacklist: set[str] = set()
         self._pending_tasks: set[asyncio.Task] = set()
         self._state = PokeStateManager()
-        # 启动期 _probe_emoji_keywords 探测出的「真的能查到表情」的关键词。
-        # 运行时 _sample_probe_keywords 优先采样这些已验证关键词，命中率更高。
-        # 注意：表情库可能后续注册新表情，因此「未验证」不代表「永远不命中」，
-        # 采样时仍会混入未验证关键词作为补充与刷新机制。
+        # 启动期探测命中的关键词；运行时优先采样以提高 RPC 命中率，
+        # 但会混入未验证关键词作为表情库新增表情后的刷新机制。
         self._validated_emoji_keywords: list[str] = []
-        # 已验证关键词的连续 miss 计数：累计达到 EMOJI_KEYWORD_MISS_THRESHOLD 后
-        # 自动从验证集中移除，处理「表情库后来被删，关键词长期失效」的场景。
         self._validated_emoji_miss_counts: dict[str, int] = {}
-        # 主动戳的群白名单 / 黑名单字符串集合，与 _blacklist 一同在 _refresh_user_sets 里刷新
         self._proactive_whitelist_groups: set[str] = set()
         self._proactive_blacklist_groups: set[str] = set()
-        # 缓存最近一次观测到的 self_id：proactive observe 阶段拿不到 self_id，
-        # 而第一次戳一戳事件触达后能从 napcat payload 学到它，可用于过滤"自己说话触发主动戳"等边界。
-        # 拿不到也不致命：麦麦自己发的消息从 send.* 出站，理论上不会再被 receive Hook 接到。
+        # OBSERVE 阶段拿不到 self_id；从 napcat additional_config / payload 学到后缓存，
+        # 用于过滤"自己说话触发主动戳"等边界。拿不到也不致命。
         self._last_known_self_id: str = ""
-        # 主动戳的 per-group asyncio.Lock：保证"冷却检查 + mark"是原子的，
-        # 避免高速消息流下同一群多个并发任务同时穿过冷却 → 双发。
-        # 锁惰性创建；正常使用下群数量是常数，不主动清理（即使万级群也只占几 MB）。
+        # 主动戳锁结构：per-group 防同群双发，global 防跨群同时穿过乐观快检。
         self._proactive_locks: dict[str, asyncio.Lock] = {}
-        # 主动戳全局 asyncio.Lock：per-group lock 只能防同群双发，
-        # 但全局冷却 (_last_proactive_global_at) 是跨群共享状态——
-        # 多个群并发任务在各自 per-group lock 内可同时通过 in_proactive_global_cooldown 检查，
-        # 双双 mark_proactive，导致 global_cooldown_seconds 被穿透。
-        # 用单独的全局锁把"全局冷却二次确认 + mark_proactive"包成原子，
-        # 锁持有时间极短（仅几行同步代码），不会阻塞其他群的 RPC 阶段。
         self._proactive_global_lock: asyncio.Lock = asyncio.Lock()
-        # 主动戳后台任务实时计数：_spawn_background_task 自带的 _pending_tasks 不区分 label，
-        # 这里单独计数 proactive，便于按 PROACTIVE_TASK_QUEUE_LIMIT 背压。
         self._proactive_active_count: int = 0
-        # send_poke 失败抑制：按 label 记录最近一次"已打出 warning"的时间戳，
-        # 同 label 在 SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS 内的失败降级为 debug。
         self._send_poke_failure_warned_at: dict[str, float] = {}
+        # on_unload 入口置 True，_spawn_background_task 据此拒收新任务。
+        self._shutting_down: bool = False
 
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
         self._refresh_user_sets()
+        # 把 manifest 版本号同步回 config.plugin.version：避免 config.toml 与 _manifest.json 漂移
+        try:
+            if self.config.plugin.version != PLUGIN_VERSION:
+                self.config.plugin.version = PLUGIN_VERSION
+        except Exception:
+            self.ctx.logger.debug("同步 plugin.version 到 manifest 失败", exc_info=True)
         self.ctx.logger.info("智能戳一戳插件(v%s)初始化完成。", PLUGIN_VERSION)
-        # 探测一次表情库的 emotion 标签，提示用户关键词命中情况
         self._spawn_background_task(self._probe_emoji_keywords(), "emoji_keyword_probe")
 
     async def on_unload(self) -> None:
-        # 取消未完成的反应任务并等待真正终止，避免 Runner 卸载后还在调用 capability
+        # 拒收新任务后再 cancel/gather，避免 gather 完成后又有"漏网之鱼"被孤立
+        self._shutting_down = True
         to_cancel = [t for t in self._pending_tasks if not t.done()]
         for task in to_cancel:
             task.cancel()
@@ -1117,7 +1015,6 @@ class SmartPokePlugin(MaiBotPlugin):
             self.ctx.logger.info("配置已热更新完成。")
 
     def _refresh_user_sets(self) -> None:
-        """把配置中的黑名单 / 主动戳群白名单 / 黑名单归一化成字符串集合，便于 O(1) 查询。"""
         cfg = self.config
         self._blacklist = {str(x).strip() for x in cfg.user_control.blacklist if str(x).strip()}
         self._proactive_whitelist_groups = {
@@ -1128,21 +1025,16 @@ class SmartPokePlugin(MaiBotPlugin):
         }
 
     def _spawn_background_task(self, coro: Any, label: str, timeout: float = 120.0) -> None:
-        """提交后台任务并登记到 _pending_tasks；带超时兜底防止挂死。
+        """提交后台任务，带超时兜底；卸载期或主动戳超并发时直接 close coroutine。"""
+        if self._shutting_down:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            return
 
-        子协程内部理应已有 try/except，本封装的超时只是最后一道防护：
-        - 默认 120 秒：max_delay_seconds 上限 60s + 几次 RPC 调用，留出充足缓冲；
-          将原本的 60s 提到 120s 是为了避免「max_delay 接近上限时正常路径自身
-          刚好顶到超时」的边界。
-        - 触发 TimeoutError 时 wait_for 会取消子协程，输出 warning。
-
-        ``label == "proactive"`` 时启用背压：若当前主动戳并发任务已达 ``PROACTIVE_TASK_QUEUE_LIMIT``，
-        直接 close 掉新提交的 coroutine 并打 debug。这样在群高速刷屏时也只是丢弃后续触发，
-        不会拖垮 Runner；其余 label（react / silent / bystander）不受此限制。
-        """
         is_proactive = label == "proactive"
         if is_proactive and self._proactive_active_count >= PROACTIVE_TASK_QUEUE_LIMIT:
-            # 显式关闭避免 "coroutine was never awaited" 警告
             try:
                 coro.close()
             except Exception:
@@ -1170,22 +1062,12 @@ class SmartPokePlugin(MaiBotPlugin):
         def _on_done(t: asyncio.Task) -> None:
             self._pending_tasks.discard(t)
             if is_proactive:
-                # 计数可能因热重载等极端情况错位，保底不让它跑成负数
                 self._proactive_active_count = max(0, self._proactive_active_count - 1)
 
         task.add_done_callback(_on_done)
 
     def _sample_probe_keywords(self, keywords: list[str]) -> list[str]:
-        """挑出本次用于「按描述搜表情」的关键词子集。
-
-        采样策略：
-        1. 已验证关键词（启动期探测命中过的）优先随机放在前面；
-        2. 未验证关键词随机洗牌后接在后面，作为补充与刷新——表情库可能后续
-           注册了新表情让某些关键词突然变得能命中；
-        3. 最终截到 ``EMOJI_KEYWORD_PROBE_LIMIT``。
-
-        因此每次反应最多发 LIMIT 次 RPC，但命中率显著高于纯随机洗牌。
-        """
+        """采样关键词：已验证的优先，未验证的作为表情库新增的刷新机制混入。"""
         cleaned = [str(k).strip() for k in keywords if str(k).strip()]
         if not cleaned:
             return []
@@ -1197,22 +1079,11 @@ class SmartPokePlugin(MaiBotPlugin):
         return (validated + unvalidated)[:EMOJI_KEYWORD_PROBE_LIMIT]
 
     async def _probe_emoji_keywords(self) -> None:
-        """启动后试探一次按关键词搜表情，记录命中关键词到验证集。
+        """启动后探测关键词命中情况。
 
-        关键约束：必须等主程序的表情库（emoji_manager.emojis）加载完成后才能调用
-        ``emoji.get_by_description``。否则主程序内部在 emoji 列表为空时会打出
-        "[获取表情包] 表情包列表为空" warning，启动期会被刷屏。
-
-        因此分三步：
-        1. 用 ``emoji.get_emotions()`` 轮询「表情库是否就绪」——该 RPC 表情库为空时
-           只是返回空列表（success=True），不会触发主程序 warning，是无副作用的就绪信号；
-        2. 拿到非空 emotion 列表后，本地做关键词与 emotion 标签的双向子串匹配，
-           本地命中的关键词直接进验证集，零额外 RPC；
-        3. 仅对本地未命中的关键词再走 ``emoji.get_by_description`` 兜底探测——
-           此时表情库已就绪，不再有 warning 风险，命中率也明显更高。
-
-        若轮询超出 ``EMOJI_READY_POLL_MAX_ATTEMPTS`` 仍未就绪，则放弃启动期探测，
-        运行时 ``_pick_emoji`` 仍会按需采样关键词工作，只是命中率不如启动期预热过。
+        必须先用无副作用的 ``emoji.get_emotions`` 轮询表情库就绪，再做本地子串匹配，
+        最后对未匹配的关键词发 ``emoji.get_by_description`` 兜底——否则表情库为空时
+        ``get_by_description`` 会触发主程序的 "[获取表情包] 表情包列表为空" warning 刷屏。
         """
         keywords = [str(k).strip() for k in self.config.emoji.description_keywords if str(k).strip()]
         if not keywords:
@@ -1220,7 +1091,6 @@ class SmartPokePlugin(MaiBotPlugin):
 
         await asyncio.sleep(EMOJI_PROBE_INITIAL_DELAY_SECONDS)
 
-        # 步骤 1：轮询 get_emotions 直到表情库就绪（返回非空列表）
         emotions: list[Any] = []
         for attempt in range(1, EMOJI_READY_POLL_MAX_ATTEMPTS + 1):
             try:
@@ -1238,7 +1108,6 @@ class SmartPokePlugin(MaiBotPlugin):
                         attempt, len(emotions),
                     )
                 break
-            # 表情库尚未加载完成（返回空列表 / None / 异常）：继续轮询
             if attempt < EMOJI_READY_POLL_MAX_ATTEMPTS:
                 await asyncio.sleep(EMOJI_READY_POLL_INTERVAL_SECONDS)
         else:
@@ -1249,11 +1118,9 @@ class SmartPokePlugin(MaiBotPlugin):
             )
             return
 
-        # 步骤 2：拿到 emotion 标签集后本地匹配
         emotion_set = {str(e).strip() for e in emotions if str(e).strip()}
         prevalidated: list[str] = []
         for kw in keywords:
-            # 双向子串匹配：kw 直接是标签，或被标签包含，或包含某个标签
             if any(kw == e or kw in e or e in kw for e in emotion_set):
                 prevalidated.append(kw)
         if prevalidated:
@@ -1265,7 +1132,6 @@ class SmartPokePlugin(MaiBotPlugin):
                 len(prevalidated), len(keywords), ", ".join(prevalidated),
             )
 
-        # 步骤 3：本地未匹配的关键词走 RPC 兜底；若已全部命中则直接结束
         remaining = [kw for kw in keywords if kw not in prevalidated]
         if not remaining:
             return
@@ -1317,18 +1183,14 @@ class SmartPokePlugin(MaiBotPlugin):
 
         ctx = self._extract_poke_context(message)
         if ctx is None:
-            # 不是戳一戳事件 → 放行
             return None
 
         # ----- 分支一：戳的不是麦麦（别人互戳）-----
         if not ctx.is_poking_bot:
-            # 麦麦自己发起的戳（含主动戳 / 回戳 / 跟风戳触发的 notify 回声）：
-            # send_poke 出去后 napcat 会回灌一条 poker_id=self_id 的事件，这里立即放行而不进入
-            # _maybe_trigger_bystander —— 后者内部本来也会 return False，但提前过滤能省掉
-            # 多次连续回戳 (back_poke_max_times > 1) 时 n 倍回声逐一走完整套检查的开销。
+            # send_poke 出去后 napcat 会回灌一条 poker_id=self_id 的事件，提前过滤掉
+            # 多次连续回戳产生的 n 倍回声逐一走完整套检查的开销
             if ctx.poker_id == ctx.self_id:
                 return None
-            # 仅尝试触发跟风戳；是否拦截事件由 bystander.swallow_event 决定
             triggered = self._maybe_trigger_bystander(ctx)
             if triggered and self.config.bystander.swallow_event:
                 return {"action": "abort"}
@@ -1336,28 +1198,21 @@ class SmartPokePlugin(MaiBotPlugin):
 
         # ----- 分支二：戳的是麦麦本人 -----
 
-        # 麦麦戳麦麦自己：根据开关决定
         if ctx.poker_id == ctx.self_id and self.config.user_control.ignore_self_poke:
             return {"action": "abort"}
 
-        # 黑名单：拦截但不反应
         if ctx.poker_id in self._blacklist:
             self.ctx.logger.debug("黑名单用户 %s 的戳一戳已静默拦截", ctx.poker_id)
             return {"action": "abort"}
 
-        # 群聊/私聊总开关：关闭场景下放行事件，让 Host 自行处理
         if ctx.is_group and not self.config.reaction.react_in_group:
             return None
         if not ctx.is_group and not self.config.reaction.react_in_private:
             return None
 
-        # 暴戳计数：在冷却检查之前累计，让"被一直骚扰就进入被烦状态"语义稳定生效。
-        # 之前顺序是 cooldown → record，这会让 cooldown_seconds=8 + spam_threshold=5
-        # 的默认组合几乎无法触发——用户连戳被冷却全部拦截，spam 窗口里只能记到 1 次。
-        # 改为先 record：黑名单/场景拦截后才不计（已经决定彻底不理），冷却拦截仍计，
-        # 因为"对方依然在骚扰我"这件事和"我有没有反应"是两回事。
-        # scope_key 用 spam_scope_key（群聊=group_id、私聊=poker_id），与 cooldown_key 解耦，
-        # 确保 proactive 分支的 _poked_bot_recently(group_id) 能稳定查到记录。
+        # 暴戳计数必须在冷却检查之前累计：否则 cooldown_seconds=8 + spam_threshold=5
+        # 的默认组合下连戳全被冷却拦截，spam 窗口里只能记到 1 次。
+        # 用 spam_scope_key 而非 cooldown_key，确保 proactive 的 _poked_bot_recently(group_id) 能命中。
         poke_count = self._state.record_poke_and_count(
             ctx.spam_scope_key,
             ctx.poker_id,
@@ -1365,7 +1220,6 @@ class SmartPokePlugin(MaiBotPlugin):
         )
         is_spam = poke_count >= self.config.reaction.spam_threshold
 
-        # 冷却（按 cooldown_key + poker_id 维度：不同人独立冷却）
         if self._state.in_cooldown(
             ctx.cooldown_key, ctx.poker_id, self.config.reaction.cooldown_seconds
         ):
@@ -1375,9 +1229,7 @@ class SmartPokePlugin(MaiBotPlugin):
             )
             return {"action": "abort"}
 
-        # 滑动窗口频率限制：与逐人冷却互补——逐人冷却拦不住"10 个人轮番戳麦麦"，
-        # 这里在通过冷却但即将进入反应分支前再做一道"过去 60 秒内总反应数"检查。
-        # 静默 abort，不消耗 silent_chat_probability 也不推 spam 状态（spam 已经在上面记过了）。
+        # 滑动窗口频率限制：逐人冷却拦不住"10 个人轮番戳麦麦"
         max_per_minute = self.config.reaction.max_reactions_per_minute
         if max_per_minute > 0:
             window_count = self._state.peek_reaction_window(60)
@@ -1388,65 +1240,46 @@ class SmartPokePlugin(MaiBotPlugin):
                 )
                 return {"action": "abort"}
 
-        # 反应概率
         if random.random() > self.config.reaction.react_probability:
             self.ctx.logger.debug(
                 "[%s] 戳一戳触发概率未命中，静默拦截", ctx.cooldown_key or ctx.poker_id
             )
-            # 未命中也按 silent_chat_probability 概率偶尔挤一句 silent_replies
             chat_prob = self.config.reaction.silent_chat_probability
             if chat_prob > 0 and random.random() < chat_prob:
-                # 冷却由 _silent_reply 内部在「确认能挤出一句话」（stream_id 解析成功
-                # 且回复池非空）后再消耗，避免白白冷却用户。
                 self._spawn_background_task(self._silent_reply(ctx), "silent_reply")
-                # silent_reply 也算"做出了反应"，统一拦截事件
                 return {"action": "abort"}
-            # 什么都没发：由 swallow_when_silent 决定是否吞事件
             if self.config.reaction.swallow_when_silent:
                 return {"action": "abort"}
             return None
 
         self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
 
-        # 异步执行反应（避免阻塞 Hook 链）
         self._spawn_background_task(
             self._react(ctx, is_spam, poke_count),
             "react",
         )
 
-        # 拦截事件，避免 Host 把 "XX 发起了戳一戳" 当成普通消息再走一遍消息流程
         return {"action": "abort"}
 
     # ===== 跟风戳 =====
 
     def _maybe_trigger_bystander(self, ctx: PokeContext) -> bool:
-        """检查是否应当对一次「别人互戳」事件做跟风反应。
-
-        返回 ``True`` 表示已经派发跟风戳任务（调用方据此决定是否吞事件）；
-        返回 ``False`` 表示本次跳过（任何前置检查未通过、或概率未命中）。
-        """
+        """返回 ``True`` 表示已派发跟风戳任务，调用方据此决定是否吞事件。"""
         cfg = self.config.bystander
         if not cfg.enabled:
             return False
-        # 跟风戳只在群聊场景成立：私聊本来就只有用户和麦麦两人，没有第三方目标。
         if not ctx.is_group:
             return False
-        # 群聊响应总开关：用户关掉群聊响应通常也意味着「群里别凑热闹」，跟着禁用跟风戳
         if not self.config.reaction.react_in_group:
             return False
-        # 戳的人或被戳的人是麦麦自己：交给主分支处理
         if ctx.poker_id == ctx.self_id or ctx.target_id == ctx.self_id:
             return False
-        # 冷却：按 cooldown_key 维度（群聊场景下回退到 group_id）
         bystander_key = ctx.cooldown_key
         if self._state.in_bystander_cooldown(bystander_key, cfg.cooldown_seconds):
             return False
-        # 概率
         if random.random() > cfg.probability:
             return False
 
-        # 选定跟风目标（_pick_bystander_target 内部已过滤黑名单，
-        # 因此 random 策略下选到黑名单成员时会自动尝试另一个；都被过滤则返回空）
         target_id = self._pick_bystander_target(ctx)
         if not target_id:
             return False
@@ -1460,21 +1293,13 @@ class SmartPokePlugin(MaiBotPlugin):
         return True
 
     def _pick_bystander_target(self, ctx: PokeContext) -> str:
-        """根据策略挑选要跟风戳的对象；自动跳过黑名单成员。
-
-        - ``victim``：优先戳被戳者；若被戳者在黑名单则返回空（不退化到戳发起者，
-          保持策略语义清晰）。
-        - ``poker``：优先戳发起者；同上，黑名单则返回空。
-        - ``random``：两人候选随机洗牌后按顺序找第一个非黑名单的，
-          只要两人中至少一个不在黑名单就会成功，避免随机选到黑名单时整次出手浪费。
-        """
+        """按 target_strategy 挑选跟风对象；命中黑名单则返回空串而不退化策略。"""
         strategy = self.config.bystander.target_strategy
         if strategy == "victim":
             candidates = [ctx.target_id]
         elif strategy == "poker":
             candidates = [ctx.poker_id]
         else:
-            # random：洗牌让两人机会均等
             candidates = [ctx.target_id, ctx.poker_id]
             random.shuffle(candidates)
 
@@ -1484,7 +1309,6 @@ class SmartPokePlugin(MaiBotPlugin):
         return ""
 
     async def _react_bystander(self, ctx: PokeContext, target_id: str) -> None:
-        """跟风戳：延迟后给指定目标戳一下，纯戳不发文字。"""
         cfg = self.config.bystander
         lo = max(0.0, cfg.min_delay_seconds)
         hi = max(lo, cfg.max_delay_seconds)
@@ -1492,7 +1316,6 @@ class SmartPokePlugin(MaiBotPlugin):
         if delay > 0:
             await asyncio.sleep(delay)
 
-        # 延迟期间顺带解析一下 target 昵称，方便后续日志/文字模板使用
         if ctx.is_group and ctx.group_id and target_id == ctx.target_id and not ctx.target_name:
             resolved = await self._resolve_member_name(ctx.group_id, target_id)
             if resolved:
@@ -1521,12 +1344,10 @@ class SmartPokePlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def observe_message_for_proactive(self, message: dict | None = None, **kwargs):
-        """OBSERVE 旁路：每条入站群消息都会被「考虑」一次，再交由判定函数层层过滤。
+        """OBSERVE 旁路：每条入站群消息都被"考虑"一次，再交由判定函数层层过滤。
 
-        - ``OBSERVE`` 模式不会阻塞主消息链，也不会影响插件自身的戳一戳处理逻辑；
-        - 当主 BLOCKING handler 对戳一戳事件 ``abort`` 时，dispatcher 在切到本 OBSERVE
-          之前就 ``break`` 了 —— 因此戳一戳通知不会触发主动戳，避免事件回声；
-        - 普通消息时主 BLOCKING handler ``return None``，本 OBSERVE 会被调度。
+        主 BLOCKING handler 对戳一戳事件 ``abort`` 时 dispatcher 会先 ``break``，
+        所以戳一戳通知不会触发主动戳，避免事件回声。
         """
         del kwargs
 
@@ -1546,23 +1367,13 @@ class SmartPokePlugin(MaiBotPlugin):
         return None
 
     def _extract_proactive_signal(self, message: Any) -> tuple[str, str] | None:
-        """从入站消息中提取「群 ID + 说话人 ID」二元组，不满足主动戳前置条件则返回 ``None``。
+        """快速排除：仅做廉价过滤，重活留给 ``_maybe_proactive_poke``。
 
-        这里只负责「快速排除」，把真正的多重过滤留给 ``_maybe_proactive_poke``，避免在
-        OBSERVE handler 的同步路径上做重活：
-          - 必须是群聊（用户配置仅群聊触发，私聊永远不戳）；
-          - 必须是真实文本消息，跳过通知事件（含 napcat notify.poke 自身），避免回声；
-          - 说话人不能是麦麦自己 —— 通过 ``_last_known_self_id`` 兜底过滤；
-          - 群 ID 必须是正整数；user_id 必须非空。
-
-        额外职责：从 napcat codec 注入的 ``additional_config.self_id`` 学习当前 bot 账号。
-        napcat 普通消息 codec 会把 ``self_id`` 塞进 ``additional_config``，让我们不必
-        等到第一次 notify.poke 才知道 self_id，避免冷启动期间麦麦自己的消息被算成
-        "群活跃"（_pick_proactive_target 用 self_id 过滤麦麦自己说的话）。
+        顺便从 napcat codec 注入的 ``additional_config.self_id`` 学习当前 bot 账号——
+        普通消息也会带，比等 notify.poke 提前得多。
         """
         if not isinstance(message, dict):
             return None
-        # 通知类事件（戳一戳 / 入群退群等）一律跳过：它们不是「群里有人说话」的语义信号
         if message.get("is_notify"):
             return None
 
@@ -1570,8 +1381,6 @@ class SmartPokePlugin(MaiBotPlugin):
         if not isinstance(msg_info, dict):
             return None
 
-        # 启动期 self_id 学习：napcat codec 把 self_id 塞进 additional_config，
-        # 普通消息也会带，比等 notify.poke 提前得多。
         additional = msg_info.get("additional_config") or {}
         if isinstance(additional, dict):
             learned_self_id = str(additional.get("self_id") or "").strip()
@@ -1584,7 +1393,6 @@ class SmartPokePlugin(MaiBotPlugin):
         group_id_raw = group_info.get("group_id")
         group_int = _to_positive_int(group_id_raw)
         if group_int is None:
-            # 私聊或群号异常 → 不触发主动戳
             return None
         group_id = str(group_int)
 
@@ -1595,21 +1403,13 @@ class SmartPokePlugin(MaiBotPlugin):
         if not speaker_id:
             return None
 
-        # 防御性过滤：理论上麦麦自己发的消息不会再走 receive Hook，
-        # 但若 self_id 已知就额外加一道保险。
         if self._last_known_self_id and speaker_id == self._last_known_self_id:
             return None
 
         return group_id, speaker_id
 
     def _get_proactive_lock(self, group_id: str) -> asyncio.Lock:
-        """惰性获取/创建 per-group asyncio.Lock。
-
-        - 单一事件循环下 setdefault 自身是原子的（无 await 切点），
-          因此不需要额外的注册锁；
-        - 锁不主动清理：群数量在正常使用下是常数，每个空闲 ``Lock`` 仅几十字节，
-          即使到上万规模总开销也只在 MB 级。
-        """
+        """单一事件循环下 setdefault 自身原子（无 await 切点），不需要注册锁。"""
         lock = self._proactive_locks.get(group_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -1617,24 +1417,15 @@ class SmartPokePlugin(MaiBotPlugin):
         return lock
 
     async def _maybe_proactive_poke(self, group_id: str, speaker_id: str) -> None:
-        """对一次群消息触发主动戳的完整判定与执行流程。
+        """主动戳的完整判定与执行流程。
 
-        在 OBSERVE handler 中以后台任务派发，所有耗时操作（昵称解析、最近消息回查、
-        send_poke RPC）都在这里发生，避免拖慢主消息链。
-
-        关键设计：双层锁结构
-        - 外层 per-group lock：保证同群多条消息并发触发时严格串行——
-          第一个任务 mark 完后立刻设置 chat 冷却，排队中的后续任务再次检查时被冷却拒绝。
-        - 内层全局 lock：仅保护"全局冷却二次确认 + mark_proactive"这段同步临界区，
-          防止不同群的并发任务在各自 per-group lock 内同时穿过 in_proactive_global_cooldown。
-          锁持有时间极短，不包含 RPC 调用。
-
-        RPC（resolve stream_id / message.get_recent）与延迟、send_poke 都在锁外或仅在
-        per-group lock 内，避免全局串行所有群的网络往返。
+        双层锁：per-group lock 防同群双发，global lock 保护"全局冷却二次确认 + mark"
+        临界区——不同群的并发任务可能在各自 per-group lock 内同时穿过全局乐观快检。
+        RPC 与延迟都在 per-group lock 内或锁外，避免全局串行所有群的网络往返。
         """
         cfg = self.config.proactive
 
-        # ----- 锁外早期过滤：把廉价、不可变的拒绝条件放在抢锁之前，避免无谓排队 -----
+        # ----- 锁外早期过滤 -----
         now_struct = time.localtime()
         if not _in_active_hours(cfg.active_hour_start, cfg.active_hour_end, now_struct.tm_hour):
             return
@@ -1644,17 +1435,14 @@ class SmartPokePlugin(MaiBotPlugin):
             return
         if cfg.probability <= 0:
             return
-        # 概率筛先于锁：大部分调用本就该 return，没必要排队浪费临界区时间
         if random.random() > cfg.probability:
             return
 
         target_id: str = ""
         target_name: str = ""
 
-        # ----- per-group lock：决策与候选筛选 -----
         async with self._get_proactive_lock(group_id):
-            # 一次性轻量检查：全局/群冷却 + 日上限。这里全局冷却是"乐观快检"，
-            # 真正的原子性靠后续 _proactive_global_lock 内的二次确认保障。
+            # 全局冷却是乐观快检，原子性靠后续 _proactive_global_lock 内的二次确认保障
             if self._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
                 return
             if self._state.in_proactive_chat_cooldown(group_id, cfg.per_chat_cooldown_seconds):
@@ -1692,13 +1480,9 @@ class SmartPokePlugin(MaiBotPlugin):
             if not target_id:
                 return
 
-            # ----- 全局 lock：把"全局冷却二次确认 + mark"包成原子 -----
-            # RPC 期间其他群可能已经抢先 mark；这里必须再确认一次，
-            # 否则可能两个群在各自 per-group lock 内同时通过乐观快检后双双 mark。
             async with self._proactive_global_lock:
                 if self._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
                     return
-                # 日上限也复检一次：RPC 期间可能日上限刚好被其他群打满
                 if cfg.max_pokes_per_day > 0:
                     already = self._state.proactive_daily_count(today)
                     if already >= cfg.max_pokes_per_day:
@@ -1712,7 +1496,6 @@ class SmartPokePlugin(MaiBotPlugin):
         if delay > 0:
             await asyncio.sleep(delay)
 
-        # 延迟期间昵称可能还没解析，临时补一下方便日志
         if not target_name:
             resolved = await self._resolve_member_name(group_id, target_id)
             if resolved:
@@ -1733,19 +1516,10 @@ class SmartPokePlugin(MaiBotPlugin):
         group_id: str,
         speaker_id: str,
     ) -> tuple[str, str, int]:
-        """从最近消息列表里挑选候选戳目标。
+        """挑选候选戳目标，返回 (target_id, target_name, active_count)。
 
-        返回 ``(target_id, target_name, active_count)``：
-        - ``target_id`` 为空串表示没有合适候选；
-        - ``active_count`` 是 ``recent_window_seconds`` 内非麦麦、非通知消息条数，
-          供调用方判断群活跃度。
-
-        过滤规则（按拟人化要求层层叠加）：
-        1. 跳过通知事件、麦麦自己说的话、user_id 为空的异常消息；
-        2. 候选必须在 ``lookback_seconds`` 窗口内有过发言；
-        3. ``respect_spam_history`` 打开时跳过近期戳过麦麦的人，避免报复性骚扰；
-        4. 命中插件主黑名单 ``user_control.blacklist`` 的用户永远不戳；
-        5. 根据 ``target_strategy`` 决定从候选里挑谁（最新说话者 / 随机活跃用户）。
+        active_count 是 ``recent_window_seconds`` 内的非麦麦、非通知消息条数，
+        供调用方判断群活跃度。target_id 为空串表示没有合适候选。
         """
         cfg = self.config.proactive
         now = time.time()
@@ -1754,12 +1528,11 @@ class SmartPokePlugin(MaiBotPlugin):
         self_id = self._last_known_self_id
 
         active_count = 0
-        # 用 dict 保留每个用户「最近说话时间」与昵称；按时间倒序处理，第一次见到即最新
         candidates: dict[str, tuple[float, str]] = {}
         latest_speaker_id = ""
         latest_speaker_name = ""
 
-        # message.get_recent 通常按时间正序返回；为了挑「最新说话者」反向遍历
+        # message.get_recent 通常按时间正序返回，反向遍历以挑"最新说话者"
         for msg in reversed(recent):
             if not isinstance(msg, dict):
                 continue
@@ -1781,7 +1554,6 @@ class SmartPokePlugin(MaiBotPlugin):
             uid = str(user_info.get("user_id") or "").strip()
             if not uid:
                 continue
-            # 跳过麦麦自己
             if self_id and uid == self_id:
                 continue
 
@@ -1790,7 +1562,6 @@ class SmartPokePlugin(MaiBotPlugin):
             if ts < lookback_cutoff:
                 continue
 
-            # 命中黑名单 / 暴戳历史的候选直接剔除
             if uid in self._blacklist:
                 continue
             if cfg.respect_spam_history and self._poked_bot_recently(group_id, uid):
@@ -1807,43 +1578,32 @@ class SmartPokePlugin(MaiBotPlugin):
             return "", "", active_count
 
         if cfg.target_strategy == "active_speaker":
-            # speaker_id 是触发本次 observe 的那一条消息的发送者，优先用它（与"刚说话"语义一致）；
-            # 若 speaker_id 被前面的过滤剔除（黑名单 / 暴戳 / 时间过早），退到 latest_speaker_id。
+            # speaker_id 被前面的过滤剔除时退到 latest_speaker_id；
+            # 再不行取候选里时间戳最新的那个让 active_speaker 在边界场景也成立
             if speaker_id in candidates:
                 ts_unused, uname = candidates[speaker_id]
                 del ts_unused
                 return speaker_id, uname, active_count
             if latest_speaker_id and latest_speaker_id in candidates:
                 return latest_speaker_id, latest_speaker_name, active_count
-            # 三层兜底：取候选里时间戳最新的那个，让 active_speaker 语义在边界场景也成立
             uid, (_ts_unused, uname) = max(
                 candidates.items(), key=lambda kv: kv[1][0]
             )
             return uid, uname, active_count
 
-        # random_recent
         uid = random.choice(list(candidates.keys()))
         ts_unused, uname = candidates[uid]
         del ts_unused
         return uid, uname, active_count
 
     def _poked_bot_recently(self, group_id: str, user_id: str) -> bool:
-        """是否在 proactive.respect_spam_window_seconds 内戳过麦麦：薄封装。
-
-        注意窗口取自 ``proactive.respect_spam_window_seconds``，而不是
-        ``reaction.spam_window_seconds``——后者只用于暴戳态判定，太短不足以让
-        "避开报复性骚扰"显得克制。
-        """
+        """窗口取自 ``proactive.respect_spam_window_seconds``（reaction.spam_window_seconds 太短）。"""
         return self._state.poked_bot_recently(
             group_id, user_id, self.config.proactive.respect_spam_window_seconds
         )
 
     async def _resolve_stream_id_for_group(self, group_id: str) -> str:
-        """专用于 proactive 路径的 stream_id 解析：仅按 group_id 查询、带 TTL 缓存。
-
-        与 ``_resolve_stream_id`` 不同的是这里不需要 PokeContext，避免为了主动戳
-        造一个空 ctx，逻辑上更直白；缓存共用 PokeStateManager 的 stream_id 表。
-        """
+        """专用于 proactive 路径的 stream_id 解析；缓存共用 PokeStateManager。"""
         if not group_id:
             return ""
         cached = self._state.get_cached_stream_id(group_id=group_id, user_id="")
@@ -1867,13 +1627,7 @@ class SmartPokePlugin(MaiBotPlugin):
         return stream_id
 
     async def _resolve_member_name(self, group_id: str, user_id: str) -> str:
-        """解析群成员昵称，群名片优先于 nickname；带 TTL 缓存避免重复 RPC。
-
-        - 缓存命中（含负缓存）直接返回；负缓存的值是空串，调用方据此知道「曾试过解析但失败」。
-        - 群聊调用 ``adapter.napcat.group.get_group_member_info``。
-        - 私聊场景退化到 ``adapter.napcat.account.get_stranger_info``。
-        - 任何异常或解析为空都返回空串，并写入短 TTL 负缓存，避免短时间内重复 RPC。
-        """
+        """解析群成员昵称，群名片优先于 nickname；带 TTL 缓存与负缓存。"""
         if not user_id:
             return ""
         cached = self._state.get_cached_name(group_id, user_id)
@@ -1894,7 +1648,6 @@ class SmartPokePlugin(MaiBotPlugin):
                     no_cache=False,
                 )
                 if isinstance(info, dict):
-                    # 群名片优先于昵称
                     name = str(info.get("card") or info.get("nickname") or "").strip()
             else:
                 user_int = _to_positive_int(user_id)
@@ -1911,7 +1664,6 @@ class SmartPokePlugin(MaiBotPlugin):
             self.ctx.logger.debug(
                 "解析昵称失败 (group=%s, user=%s)", group_id, user_id, exc_info=True
             )
-            # 失败也写入负缓存，避免连戳同一用户时反复重试
             self._state.cache_name(
                 group_id, user_id, "", MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS
             )
@@ -1920,7 +1672,6 @@ class SmartPokePlugin(MaiBotPlugin):
         if name:
             self._state.cache_name(group_id, user_id, name, MEMBER_NAME_CACHE_TTL_SECONDS)
         else:
-            # 查询成功但拿不到任何可用字段：同样写负缓存，复用短 TTL
             self._state.cache_name(
                 group_id, user_id, "", MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS
             )
@@ -1929,18 +1680,12 @@ class SmartPokePlugin(MaiBotPlugin):
     # ===== 反应主流程 =====
 
     async def _silent_reply(self, ctx: PokeContext) -> None:
-        """react_probability 未命中时按 silent_chat_probability 概率挤出的一句轻反应。
+        """react_probability 未命中时按 silent_chat_probability 概率挤一句。
 
-        与正常反应分支不同：不参与反应类型抽样，只挑一句 silent_replies。
-        ``silent_replies`` 池为空时直接放弃发送——尊重「用户清空就是想沉默」的语义，
-        不再回落到 normal_replies，避免「我特意删掉沉默池却仍在嘀咕普通回复」的反直觉。
-
-        冷却由本函数内部在「确认能挤出一句话」后才消耗——先解析 stream_id 与回复池，
-        都成立才标记冷却。这样 stream_id 解析失败 / 回复池为空时不会冷却用户，
-        避免「想挤话却挤不出还白白冷却，下一次戳又被冷却拦截」的尴尬。
+        冷却在"确认能挤出一句话"后才消耗（解析 stream_id 成功且回复池非空），
+        避免 stream_id 解析失败 / 池为空时白白冷却用户。
         """
         try:
-            # 先解析 stream_id：失败立即放弃，且不消耗冷却
             stream_id = await self._resolve_stream_id(ctx)
             if not stream_id:
                 self.ctx.logger.debug(
@@ -1950,11 +1695,9 @@ class SmartPokePlugin(MaiBotPlugin):
                 return
             pool = self.config.fallback.silent_replies
             if not pool:
-                # 用户主动清空 silent_replies 等价于「沉默就是沉默，连嘀咕也不要」
                 self.ctx.logger.debug("[silent_reply] silent 回复池为空，按沉默语义放弃发送")
                 return
-            # 二次确认滑动窗口：handle_poke_event 派发本任务时窗口尚未满，
-            # 但延迟期间可能被并发事件填满；mark 之前再 peek 一次保证总反应数严格不超上限。
+            # 二次确认滑动窗口：派发到 mark 之间可能被并发事件填满
             max_per_minute = self.config.reaction.max_reactions_per_minute
             if max_per_minute > 0 and self._state.peek_reaction_window(60) >= max_per_minute:
                 self.ctx.logger.debug(
@@ -1962,7 +1705,6 @@ class SmartPokePlugin(MaiBotPlugin):
                     ctx.poker_id,
                 )
                 return
-            # 已确认能发出一句话 → 才占用冷却，避免短时间内被同一人连戳时反复挤话
             self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
             await self._delay_a_bit()
             await self._safe_send_text(random.choice(pool), stream_id)
@@ -1970,14 +1712,9 @@ class SmartPokePlugin(MaiBotPlugin):
             self.ctx.logger.exception("silent_reply 发送失败")
 
     async def _react(self, ctx: PokeContext, is_spam: bool, poke_count: int) -> None:
-        """决定反应类型并执行；外层捕获所有异常防止背景任务挂掉。"""
         try:
-            # 先解析 stream_id 再延迟：与 _silent_reply 保持一致，避免选了 text/emoji
-            # 但 stream_id 解析失败时白白等掉几秒思考延迟才回退到回戳。
-            # napcat 注入的 notice 消息 session_id 字段是空字符串，
-            # 必须按 group_id / user_id 回查真实 stream_id 才能发文字/表情。
-            # 回戳走适配器 send_poke 直接用 group_id/user_id，不依赖 stream_id，
-            # 因此即便 stream_id 解析失败，回戳路径仍然可用。
+            # 先解析 stream_id 再延迟：避免选了 text/emoji 但 stream_id 解析失败时
+            # 白白等掉几秒思考延迟才回退到回戳。回戳走 send_poke 不依赖 stream_id。
             stream_id = await self._resolve_stream_id(ctx)
             if not stream_id:
                 self.ctx.logger.debug(
@@ -1986,7 +1723,6 @@ class SmartPokePlugin(MaiBotPlugin):
                 )
 
             kind = self._decide_reaction_kind(is_spam)
-            # 没有 stream_id 时，文字/表情类型无法发出，统一回落到回戳
             if kind in ("emoji", "text") and not stream_id:
                 kind = "poke"
 
@@ -2005,7 +1741,6 @@ class SmartPokePlugin(MaiBotPlugin):
                 ok = await self._send_back_poke(ctx, is_spam=is_spam)
                 if not ok:
                     if stream_id:
-                        # 回戳失败 → 回退文字
                         await self._send_text(stream_id, is_spam)
                     else:
                         self.ctx.logger.debug(
@@ -2018,19 +1753,16 @@ class SmartPokePlugin(MaiBotPlugin):
                 ok = await self._send_emoji(stream_id)
                 if ok:
                     return
-                # 表情发送失败 → 回退到回戳
                 self.ctx.logger.debug("表情反应失败，回退到回戳")
                 ok_poke = await self._send_back_poke(ctx, is_spam=is_spam)
                 if not ok_poke:
-                    # 回戳也失败再退到文字
                     await self._send_text(stream_id, is_spam)
                 return
 
-            # kind == "text"
             sent = await self._send_text(stream_id, is_spam)
             if sent:
                 return
-            # 文字池全空或发送失败 → 兜底回戳，避免「mark 了却什么都没发」的失声观感
+            # 兜底回戳，避免 mark 了却什么都没发
             self.ctx.logger.debug(
                 "[smart_poke] 文字反应未发出，回退到回戳 (poker=%s)", ctx.poker_id,
             )
@@ -2039,7 +1771,6 @@ class SmartPokePlugin(MaiBotPlugin):
             self.ctx.logger.exception("反应戳一戳时出错")
 
     async def _delay_a_bit(self) -> None:
-        """按配置范围随机延迟，模拟思考时间。"""
         cfg = self.config.reaction
         lo = max(0.0, cfg.min_delay_seconds)
         hi = max(lo, cfg.max_delay_seconds)
@@ -2048,17 +1779,9 @@ class SmartPokePlugin(MaiBotPlugin):
             await asyncio.sleep(delay)
 
     def _decide_reaction_kind(self, is_spam: bool) -> str:
-        """按配置权重选择反应类型。返回 'poke' / 'emoji' / 'text'。
+        """按权重抽取反应类型；暴戳态下回戳 ×1.5、表情 ×0.3、文字 ×1.2。
 
-        三个权重独立配置，不要求加起来等于 1：取它们的总和后归一化分配。
-        暴戳态下按拟人语义重新分布：
-        - 回戳权重抬高（×1.5）：呼应"被烦了就连戳几下还回去"，一旦命中会触发
-          ``_send_back_poke`` 内的暴戳分支自动戳到 ``back_poke_max_times`` 上限。
-        - 表情权重大幅削弱（×0.3）：被烦了还发可爱表情明显违和。
-        - 文字权重略抬高（×1.2）：让"嘴硬抱怨"也有合理出现率，但不再主导分布。
-        归一化后，默认权重 (0.4/0.3/0.2) 在暴戳态下变为大约 0.6/0.09/0.24，
-        约 64% / 9% / 26% 的分布，回戳成为主反应方式。
-        「真正沉默」由 handle_poke_event 中的 react_probability 未命中分支负责，
+        「真正沉默」由 handle_poke_event 的 react_probability 未命中分支负责，
         与本方法的反应类型抽样无关。
         """
         cfg = self.config.reaction
@@ -2072,7 +1795,7 @@ class SmartPokePlugin(MaiBotPlugin):
         }
         total = sum(weights.values())
         if total <= 0:
-            return "text"  # 全部权重为 0 时兜底为文字
+            return "text"
 
         roll = random.random() * total
         cumulative = 0.0
@@ -2085,13 +1808,7 @@ class SmartPokePlugin(MaiBotPlugin):
     # ===== 反应实现 =====
 
     def _log_send_poke_failure(self, label: str, reason: str, *, exc: bool = False) -> None:
-        """同 label 的 send_poke 失败在 SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS 窗口内
-        只打一条 warning，避免风控/频控期间几十条相同栈刷屏。窗口内的后续失败降为 debug。
-
-        - ``label`` 已能区分 back_poke / bystander / proactive，多路径不会互相吞噬；
-        - ``exc=True`` 时把异常堆栈一起记录；
-        - 抑制窗口对 debug 不生效——开 DEBUG 调试时仍能看到每一次失败。
-        """
+        """同 label 的失败在抑制窗口内只打一条 warning，避免风控期相同栈刷屏。"""
         now = time.time()
         last_warned = self._send_poke_failure_warned_at.get(label, 0.0)
         if now - last_warned >= SEND_POKE_FAILURE_LOG_SUPPRESS_SECONDS:
@@ -2114,11 +1831,8 @@ class SmartPokePlugin(MaiBotPlugin):
     ) -> bool:
         """统一封装 adapter.napcat.message.send_poke 调用。
 
-        - 私聊：仅传 ``user_id``。
-        - 群聊：同时传 ``user_id`` / ``group_id`` / ``target_id``（按 NapCat 隐藏 schema
-          要求），其中 ``target_id`` 与 ``user_id`` 同值，明确指向被戳对象。
-
-        返回 True 表示调用成功（NapCat 已接受请求）。
+        群聊场景按 NapCat 隐藏 schema 同时传 user_id / group_id / target_id，
+        其中 target_id 与 user_id 同值。返回 True 表示 NapCat 已接受请求。
         """
         target_int = _to_positive_int(target_id)
         if target_int is None:
@@ -2136,19 +1850,17 @@ class SmartPokePlugin(MaiBotPlugin):
             resp = await self.ctx.api.call(
                 "adapter.napcat.message.send_poke", **call_kwargs
             )
-            # 宿主层在 RPC 无响应 / 反序列化失败时会返回 None；这种情况下没法判断
-            # NapCat 是否真的接到了请求，按"未成功"处理更稳妥，让上层走兜底路径。
+            # 宿主层 RPC 无响应 / 反序列化失败时返回 None，按"未成功"处理让上层走兜底
             if resp is None:
                 self._log_send_poke_failure(label, "send_poke 无响应 (resp=None)")
                 return False
             if isinstance(resp, dict):
-                # 宿主层 RPC 失败：resp = {"success": False, "error": "..."}
                 if resp.get("success") is False:
                     self._log_send_poke_failure(
                         label, f"宿主调用失败: {resp.get('error')}"
                     )
                     return False
-                # NapCat 业务级失败：resp 直接是 NapCat 原始响应，含 status / retcode
+                # NapCat 业务级失败：resp 直接是 NapCat 原始响应
                 status = str(resp.get("status") or "").strip().lower()
                 retcode = resp.get("retcode")
                 if (status and status not in ("ok", "async")) or (
@@ -2162,25 +1874,17 @@ class SmartPokePlugin(MaiBotPlugin):
                     return False
             return True
         except Exception:
-            # 风控 / 频率限制场景下 send_poke 会反复失败，stack trace 会刷屏，
-            # 抑制窗口内只打 debug，让用户按需开 DEBUG 看完整堆栈即可。
             self._log_send_poke_failure(label, "调用异常", exc=True)
             return False
 
     async def _send_back_poke(self, ctx: PokeContext, is_spam: bool = False) -> bool:
         """通过 NapCat 适配器发送回戳，支持多次连续戳。
 
-        防御自戳死循环：当 user_control.ignore_self_poke=False 且麦麦戳了自己时，
-        主分支会进入反应流程；若再回戳麦麦自己，新的 send_poke 会触发又一条
-        notify.poke 事件被本插件接收，导致无限循环。这里兜底拒绝，让 _react
-        回退到文字（如果 stream_id 可用）或直接放弃本次反应。
+        防自戳死循环：ignore_self_poke=False 时若让麦麦回戳自己，新的 send_poke
+        会再触发一条 notify.poke 被本插件接收，导致无限循环。
 
-        多次回戳：
-        - ``back_poke_max_times == 1`` 时（默认）行为与单次完全一致；
-        - 普通状态下随机 1~max 次，给行为引入波动避免被识别为定时器；
-        - ``is_spam=True``（暴戳状态）固定为 max 次，对应"被烦了一连串戳回去"的拟人语义；
-        - 每两次之间 0.3~0.8s 随机短延迟：保留"连戳"节奏，又不会扎堆把 NapCat 风控点燃；
-        - 任一中途失败立即停止（可能已经被风控或被对方屏蔽），返回 True 当且仅当至少有一次成功。
+        每两次之间 0.3~0.8s 随机短延迟避免请求扎堆触发风控；
+        任一中途失败立即停止（可能已被风控）。
         """
         if ctx.poker_id == ctx.self_id:
             self.ctx.logger.warning(
@@ -2189,7 +1893,6 @@ class SmartPokePlugin(MaiBotPlugin):
             return False
 
         max_times = max(1, self.config.reaction.back_poke_max_times)
-        # 暴戳：直接戳到上限，"狠"一点；非暴戳：随机抽，给行为加扰动
         times = max_times if is_spam else random.randint(1, max_times)
 
         any_success = False
@@ -2200,7 +1903,6 @@ class SmartPokePlugin(MaiBotPlugin):
             if ok:
                 any_success = True
             else:
-                # 中途失败立即停止：避免被风控时还继续刷请求加剧问题
                 break
             if i < times - 1:
                 await asyncio.sleep(random.uniform(0.3, 0.8))
@@ -2213,20 +1915,15 @@ class SmartPokePlugin(MaiBotPlugin):
         return any_success
 
     async def _send_text(self, stream_id: str, is_spam: bool) -> bool:
-        """从配置的回复池中随机挑一句文字发出。
+        """从配置的回复池中随机挑一句发出。
 
-        池回落链：
-        - 暴戳态：spam_replies → normal_replies；**不再回落到 silent_replies**——
-          暴戳态下蹦个 "..." 反差太大，会破坏"被烦了语气更冲"的人设；
-          若前两档全空，就让 _react 走兜底回戳更合适。
-        - 普通态：normal_replies → silent_replies——普通态偶尔嘀咕一句没有违和感。
-
-        返回是否成功投递，便于上层做兜底回戳。
+        暴戳态不回落到 silent_replies——"..."与"被烦了"语气冲突；前两档全空时
+        让 _react 走兜底回戳更合适。
         """
         if is_spam:
             primary = self.config.fallback.spam_replies
             secondary = self.config.fallback.normal_replies
-            tertiary: list[str] = []  # 暴戳态不兜到 silent，让外层走回戳
+            tertiary: list[str] = []
         else:
             primary = self.config.fallback.normal_replies
             secondary: list[str] = []
@@ -2269,15 +1966,10 @@ class SmartPokePlugin(MaiBotPlugin):
             return False
 
     async def _pick_emoji(self) -> dict[str, Any] | None:
-        """挑一张表情包。优先按关键词搜，找不到时按配置回退随机。
+        """优先按关键词搜，找不到时按配置回退随机。
 
-        SDK 已经按 ``_CAPABILITY_RESULT_KEYS`` 表自动解包 RPC 响应：
-        - ``emoji.get_by_description`` 直接返回 ``{"base64": ..., "description": ..., "emotion": ...}`` 或 ``None``。
-        - ``emoji.get_random`` 直接返回 ``[{...}, ...]`` 列表。
-
-        关键词采样策略与启动期探测共用 ``_sample_probe_keywords``，保证两边一致。
-        运行时若发现未验证关键词也能命中（表情库注册了新表情），会顺手把它写入验证集，
-        让后续采样优先复用。
+        运行时发现未验证关键词命中（表情库新增表情）会顺手写入验证集；
+        已验证关键词连续 miss 到阈值则从验证集移除，应对表情库被删的场景。
         """
         probe = self._sample_probe_keywords(self.config.emoji.description_keywords)
 
@@ -2287,12 +1979,9 @@ class SmartPokePlugin(MaiBotPlugin):
                 if isinstance(emoji, dict) and emoji:
                     if kw not in self._validated_emoji_keywords:
                         self._validated_emoji_keywords.append(kw)
-                    # 命中 → 清零 miss 计数，让该关键词继续留在验证集中优先采样
                     self._validated_emoji_miss_counts.pop(kw, None)
                     return emoji
                 self.ctx.logger.debug("按关键词 %s 没找到合适表情", kw)
-                # 已验证关键词连续 miss 累计到阈值 → 从验证集中剔除，
-                # 避免「表情库被删后该关键词永远 miss 但每次仍被优先尝试」
                 if kw in self._validated_emoji_keywords:
                     misses = self._validated_emoji_miss_counts.get(kw, 0) + 1
                     if misses >= EMOJI_KEYWORD_MISS_THRESHOLD:
@@ -2347,8 +2036,6 @@ class SmartPokePlugin(MaiBotPlugin):
         if not isinstance(payload, dict):
             return None
 
-        # self_id：napcat codec 同时把 self_id 塞进 additional_config 和原 payload，
-        # payload 是直接 dict(payload)，所以两边其实是同一份，直接读 payload 即可。
         self_id = str(payload.get("self_id") or "").strip()
         poker_id = str(payload.get("user_id") or "").strip()
         target_id = str(payload.get("target_id") or "").strip()
@@ -2356,11 +2043,10 @@ class SmartPokePlugin(MaiBotPlugin):
         if not self_id or not poker_id or not target_id:
             return None
 
-        # 顺手把识别到的 self_id 缓存起来，给 proactive 分支提供过滤"自己说话"的兜底依据
         if self_id and self_id != self._last_known_self_id:
             self._last_known_self_id = self_id
 
-        # 严格判定 group_id：必须是正整数才视为群聊，避免 "0" / 0 等被误判
+        # 严格判定 group_id：必须正整数才视为群聊，避免 "0" / 0 被误判
         group_info = msg_info.get("group_info") or {}
         raw_group_id = payload.get("group_id")
         if raw_group_id is None or str(raw_group_id).strip() in ("", "0"):
@@ -2369,9 +2055,7 @@ class SmartPokePlugin(MaiBotPlugin):
 
         user_info = msg_info.get("user_info") or {}
 
-        # 群名片优先于昵称：与 _resolve_member_name() 保持一致，避免主反应分支
-        # 使用 nickname、跟风戳分支使用 card 的字段不一致。
-        # napcat 适配器（codecs/notice/enricher.py）会同时填充 user_nickname / user_cardname。
+        # 群名片优先于 nickname，与 _resolve_member_name 保持一致
         poker_cardname = str(user_info.get("user_cardname") or "").strip()
         poker_nickname = str(user_info.get("user_nickname") or "").strip()
 
@@ -2380,30 +2064,18 @@ class SmartPokePlugin(MaiBotPlugin):
         ctx.poker_id = poker_id
         ctx.poker_name = poker_cardname or poker_nickname
         ctx.target_id = target_id
-        # napcat 注入的 user_info 字段始终描述发起方，target 端没有现成昵称。
-        # 主分支（戳麦麦）的 target 一定是麦麦自己，不需要昵称；
-        # 跟风戳分支 (_react_bystander) 才会按需通过 _resolve_member_name() 异步补全 ctx.target_name。
+        # 主分支 target 是麦麦自己不需要昵称；跟风戳分支按需异步补 target_name
         ctx.target_name = ""
         ctx.group_id = str(group_int) if group_int is not None else ""
         ctx.is_group = group_int is not None
         ctx.stream_id = str(message.get("session_id") or "")
-        # 冷却 key fallback：napcat notice 注入的 session_id 常为空，
-        # 必须按 stream_id → group_id → poker_id 回退才能保证冷却生效。
+        # napcat notice 注入的 session_id 常为空，按 stream_id → group_id → poker_id 回退
         ctx.cooldown_key = ctx.stream_id or ctx.group_id or ctx.poker_id
-        # spam 计数 scope：群聊固定 group_id、私聊固定 poker_id。
-        # 与 cooldown_key 解耦，确保 proactive 的 _poked_bot_recently(group_id) 能命中记录。
         ctx.spam_scope_key = ctx.group_id if ctx.is_group else ctx.poker_id
         return ctx
 
     async def _resolve_stream_id(self, ctx: PokeContext) -> str:
-        """当 message.session_id 为空时，按群/用户回查 stream_id，并做 TTL 缓存。
-
-        napcat 注入的 notice 消息 session_id 固定为空，每次反应都要回查；
-        但 Host 端 stream_id 基本稳定，缓存收益明显。
-
-        SDK 返回的聊天流字典字段名是 ``session_id``（见 guide.md 中的能力代理示例），
-        这里直接读取该字段，不做多重 fallback。
-        """
+        """notice 消息 session_id 固定为空时按群/用户回查，TTL 缓存。"""
         if ctx.is_group and ctx.group_id:
             cache_group, cache_user = ctx.group_id, ""
         elif ctx.poker_id:
