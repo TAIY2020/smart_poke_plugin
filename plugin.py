@@ -175,8 +175,11 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                if isinstance(info, dict):
-                    name = str(info.get("card") or info.get("nickname") or "").strip()
+                # api.call 返回 {"success": True, "result": {...}} envelope，真实数据在 result
+                if isinstance(info, dict) and info.get("success"):
+                    data = info.get("result")
+                    if isinstance(data, dict):
+                        name = str(data.get("card") or data.get("nickname") or "").strip()
             else:
                 user_int = to_positive_int(user_id)
                 if user_int is None:
@@ -186,8 +189,10 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                if isinstance(info, dict):
-                    name = str(info.get("nickname") or info.get("nick") or "").strip()
+                if isinstance(info, dict) and info.get("success"):
+                    data = info.get("result")
+                    if isinstance(data, dict):
+                        name = str(data.get("nickname") or data.get("nick") or "").strip()
         except Exception:
             self.ctx.logger.debug(
                 "解析昵称失败 (group=%s, user=%s)", group_id, user_id, exc_info=True
