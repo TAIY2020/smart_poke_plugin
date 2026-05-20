@@ -4,7 +4,7 @@
 
 这个插件让麦麦在被戳时不再千篇一律地复读「XX 戳了我一下」，而是按概率随机选择回戳、文字调侃、发表情包或干脆装作没看见。当群里其他人互戳时麦麦还会忍不住"跟风"凑一脚；群里有人说话时也可能被勾起来主动戳一下熟人，制造点群聊乐子。
 
-> 本版本 (v1.5.0) 基于 **MaiBot SDK v2** 开发，使用 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。**推荐通过 Web UI 修改配置**，所见即所得，不用记字段名。
+> 本版本 (v1.6.0) 基于 **MaiBot SDK v2** 开发，使用 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。**推荐通过 Web UI 修改配置**，所见即所得，不用记字段名。
 
 ## ✨ 功能特性
 
@@ -41,7 +41,6 @@
 ```toml
 [plugin]
 name = "smart_poke_plugin"
-version = "1.5.0"
 config_version = "1.5.0"
 enabled = true
 

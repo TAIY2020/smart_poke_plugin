@@ -1,0 +1,353 @@
+"""Smart Poke 插件的状态层。
+
+包含：
+    * ``PokeContext`` —— 从一次戳事件解析出的关键字段。
+    * ``PokeStateManager`` —— 冷却、暴戳计数、各种 TTL 缓存、主动戳每日上限/锁的集中持有者。
+
+仅持有内存态，热重载会丢失（接受）。所有方法都是同步的；与事件循环交互的部分由
+``ProactivePoker`` / ``ReactionExecutor`` 等模块自行处理。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import defaultdict, deque
+
+
+# ----- 状态层相关常量 -----
+
+MEMBER_NAME_CACHE_TTL_SECONDS = 600.0
+MEMBER_NAME_CACHE_MAX_SIZE = 256
+MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS = 60.0
+
+# notice 消息 session_id 固定为空，stream_id 每次反应都得回查，缓存收益明显。
+STREAM_ID_CACHE_TTL_SECONDS = 1800.0
+
+
+# ----- PokeContext -----
+
+
+class PokeContext:
+    """从一次戳一戳事件中提取出的关键信息。"""
+
+    __slots__ = (
+        "is_group",
+        "self_id",
+        "poker_id",
+        "poker_name",
+        "target_id",
+        "target_name",
+        "group_id",
+        "stream_id",
+        "cooldown_key",
+        "spam_scope_key",
+    )
+
+    def __init__(self) -> None:
+        self.is_group: bool = False
+        self.self_id: str = ""
+        self.poker_id: str = ""
+        self.poker_name: str = ""
+        self.target_id: str = ""
+        self.target_name: str = ""
+        self.group_id: str = ""
+        self.stream_id: str = ""
+        # napcat notice 的 session_id 常为空，按 stream_id → group_id → poker_id 回退
+        self.cooldown_key: str = ""
+        # 与 cooldown_key 解耦：proactive 分支查 _poked_bot_recently 只能传 group_id，
+        # 必须与 record 端用同一个 scope 才能匹配
+        self.spam_scope_key: str = ""
+
+    @property
+    def is_poking_bot(self) -> bool:
+        return bool(self.self_id) and self.target_id == self.self_id
+
+
+# ----- PokeStateManager -----
+
+
+class PokeStateManager:
+    """冷却时间戳、暴戳计数、各种 TTL 缓存的集中持有者。"""
+
+    _PRUNE_THRESHOLD = 200
+    _STALE_AFTER_SECONDS = 3600
+    # 单条暴戳计数 deque 的硬上限——暴戳判定只关心 >= spam_threshold，多余的旧记录
+    # 会被天然挤出而不影响判定结果。
+    _POKE_RECORD_MAXLEN = 200
+
+    def __init__(self) -> None:
+        self._last_react_at: dict[str, float] = {}
+        self._poke_records: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN)
+        )
+        self._last_bystander_at: dict[str, float] = {}
+        self._record_counter: int = 0
+        # 反应总数滑动窗口：与逐人冷却互补，防多人轮番车轮战；
+        # 跟风戳/主动戳有各自的冷却+日上限，不占用此窗口。
+        self._reaction_window: deque[float] = deque()
+        # name=""为负缓存条目（已知该用户没有可解析昵称），TTL 配更短。
+        self._name_cache: dict[str, tuple[str, float]] = {}
+        self._stream_id_cache: dict[str, tuple[str, float]] = {}
+        self._last_proactive_at_chat: dict[str, float] = {}
+        self._last_proactive_global_at: float = 0.0
+        self._proactive_daily_count: int = 0
+        self._proactive_daily_date: str = ""
+        # per-group 主动戳锁。放在这里与 _last_proactive_at_chat 同源 prune，
+        # 避免群数量上涨时锁字典无界增长。
+        self._proactive_locks: dict[str, asyncio.Lock] = {}
+        # OBSERVE 阶段拿不到 self_id，从 napcat additional_config / payload 学到后缓存于此；
+        # 用于过滤"自己说话触发主动戳"等边界场景。拿不到也不致命。
+        self._known_self_id: str = ""
+
+    # ----- self_id -----
+
+    def set_known_self_id(self, self_id: str) -> None:
+        """从消息或 notice payload 学到 bot 自身 self_id 时调用。"""
+        if self_id and self_id != self._known_self_id:
+            self._known_self_id = self_id
+
+    def get_known_self_id(self) -> str:
+        return self._known_self_id
+
+    # ----- proactive 锁 -----
+
+    def get_proactive_lock(self, group_id: str) -> asyncio.Lock:
+        """获取或创建 per-group 主动戳锁。
+
+        单一事件循环下 dict 写无 await 切点，操作原子，不需要注册锁。
+
+        **关键不变量（调用约定）**：必须用 ``async with state.get_proactive_lock(g):``
+        同表达式立即 acquire，不要拆成两步 ``lock = state.get_proactive_lock(g); ...;
+        async with lock:``。三条同步性共同保证 prune 不会删走"已被某 task 拿到引用但
+        尚未进入 async with"的 lock 导致同群双发：
+
+            1. 本方法是同步的，调用方求值后无切点
+            2. asyncio.Lock.__aenter__ 在未被持有时走快路径，立即设 _locked=True，无 yield
+            3. _prune 显式 ``lock.locked()`` 跳过持有中的锁
+
+        拆成两步式写法会在 lock= 与 async with 之间插入潜在 await 切点，让步骤 1 失效。
+        """
+        lock = self._proactive_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._proactive_locks[group_id] = lock
+        return lock
+
+    # ----- 反应冷却 -----
+
+    @staticmethod
+    def _cooldown_key(scope_key: str, poker_id: str) -> str:
+        if not scope_key:
+            return ""
+        return f"{scope_key}:{poker_id}" if poker_id else scope_key
+
+    def in_cooldown(self, scope_key: str, poker_id: str, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0 or not scope_key:
+            return False
+        key = self._cooldown_key(scope_key, poker_id)
+        last = self._last_react_at.get(key, 0.0)
+        return (time.time() - last) < cooldown_seconds
+
+    def mark_reacted(self, scope_key: str, poker_id: str) -> None:
+        key = self._cooldown_key(scope_key, poker_id)
+        now = time.time()
+        if key:
+            self._last_react_at[key] = now
+        self._reaction_window.append(now)
+
+    def peek_reaction_window(self, window_seconds: int) -> int:
+        """返回窗口内累计反应数，顺便清理过期记录。不写入新记录。"""
+        if window_seconds <= 0:
+            return 0
+        cutoff = time.time() - window_seconds
+        while self._reaction_window and self._reaction_window[0] < cutoff:
+            self._reaction_window.popleft()
+        return len(self._reaction_window)
+
+    # ----- 跟风戳冷却 -----
+
+    def in_bystander_cooldown(self, scope_key: str, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0 or not scope_key:
+            return False
+        last = self._last_bystander_at.get(scope_key, 0.0)
+        return (time.time() - last) < cooldown_seconds
+
+    def mark_bystander(self, scope_key: str) -> None:
+        if scope_key:
+            self._last_bystander_at[scope_key] = time.time()
+
+    # ----- 暴戳计数 -----
+
+    def record_poke_and_count(
+        self, scope_key: str, poker_id: str, window_seconds: int
+    ) -> int:
+        """记录一次戳，返回窗口期内的累计次数。"""
+        if not scope_key:
+            return 0
+        key = f"{scope_key}:{poker_id}" if poker_id else scope_key
+        now = time.time()
+        cutoff = now - max(window_seconds, 1)
+        records = self._poke_records[key]
+        while records and records[0] < cutoff:
+            records.popleft()
+        records.append(now)
+
+        self._record_counter += 1
+        if self._record_counter >= self._PRUNE_THRESHOLD:
+            self._record_counter = 0
+            self._prune()
+        return len(records)
+
+    # ----- 昵称缓存 -----
+
+    @staticmethod
+    def _name_cache_key(group_id: str, user_id: str) -> str:
+        return f"{group_id}:{user_id}" if group_id else user_id
+
+    def get_cached_name(self, group_id: str, user_id: str) -> str | None:
+        if not user_id:
+            return None
+        key = self._name_cache_key(group_id, user_id)
+        entry = self._name_cache.get(key)
+        if entry is None:
+            return None
+        name, expire_at = entry
+        if expire_at < time.time():
+            self._name_cache.pop(key, None)
+            return None
+        return name
+
+    def cache_name(self, group_id: str, user_id: str, name: str, ttl: float) -> None:
+        """缓存昵称查询结果；``name`` 为空串表示负缓存（已知该用户没有可用昵称）。"""
+        if not user_id:
+            return
+        key = self._name_cache_key(group_id, user_id)
+        self._name_cache[key] = (name, time.time() + ttl)
+        if len(self._name_cache) > MEMBER_NAME_CACHE_MAX_SIZE:
+            now = time.time()
+            # value 是 (name, expire_at) 元组；按 expire_at 排序保留最晚到期的一半。
+            # 若误写成 kv[1] 会按 (name, expire_at) 元组字典序，先比 name 字符串
+            kept = sorted(
+                ((k, v) for k, v in self._name_cache.items() if v[1] >= now),
+                key=lambda kv: kv[1][1],
+                reverse=True,
+            )[: MEMBER_NAME_CACHE_MAX_SIZE // 2]
+            self._name_cache = dict(kept)
+
+    # ----- stream_id 缓存 -----
+
+    @staticmethod
+    def _stream_cache_key(*, group_id: str, user_id: str) -> str:
+        if group_id:
+            return f"group:{group_id}"
+        return f"user:{user_id}" if user_id else ""
+
+    def get_cached_stream_id(self, *, group_id: str, user_id: str) -> str | None:
+        key = self._stream_cache_key(group_id=group_id, user_id=user_id)
+        if not key:
+            return None
+        entry = self._stream_id_cache.get(key)
+        if entry is None:
+            return None
+        stream_id, expire_at = entry
+        if expire_at < time.time():
+            self._stream_id_cache.pop(key, None)
+            return None
+        return stream_id
+
+    def cache_stream_id(
+        self, *, group_id: str, user_id: str, stream_id: str, ttl: float
+    ) -> None:
+        if not stream_id:
+            return
+        key = self._stream_cache_key(group_id=group_id, user_id=user_id)
+        if not key:
+            return
+        self._stream_id_cache[key] = (stream_id, time.time() + ttl)
+
+    # ----- 主动戳：冷却与日上限 -----
+
+    def in_proactive_chat_cooldown(self, group_id: str, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0 or not group_id:
+            return False
+        last = self._last_proactive_at_chat.get(group_id, 0.0)
+        return (time.time() - last) < cooldown_seconds
+
+    def in_proactive_global_cooldown(self, cooldown_seconds: int) -> bool:
+        if cooldown_seconds <= 0:
+            return False
+        return (time.time() - self._last_proactive_global_at) < cooldown_seconds
+
+    def mark_proactive(self, group_id: str, today: str) -> None:
+        """``today`` 由调用方按本地日期生成，保持与 active_hour_* 的口径一致。"""
+        now = time.time()
+        if group_id:
+            self._last_proactive_at_chat[group_id] = now
+        self._last_proactive_global_at = now
+        if today != self._proactive_daily_date:
+            self._proactive_daily_date = today
+            self._proactive_daily_count = 0
+        self._proactive_daily_count += 1
+
+    def proactive_daily_count(self, today: str) -> int:
+        if today != self._proactive_daily_date:
+            return 0
+        return self._proactive_daily_count
+
+    def poked_bot_recently(
+        self, scope_key: str, user_id: str, window_seconds: int
+    ) -> bool:
+        """``user_id`` 是否在 ``window_seconds`` 内于 ``scope_key`` 维度戳过麦麦。
+
+        ``scope_key`` 必须与主 Hook record 端用同一维度（群聊场景下用 group_id）才能命中。
+        """
+        if not scope_key or not user_id or window_seconds <= 0:
+            return False
+        records = self._poke_records.get(f"{scope_key}:{user_id}")
+        if not records:
+            return False
+        cutoff = time.time() - window_seconds
+        return any(ts >= cutoff for ts in records)
+
+    # ----- prune / clear -----
+
+    def _prune(self) -> None:
+        """删除超过 _STALE_AFTER_SECONDS 未更新的 key，控制字典体积。"""
+        cutoff = time.time() - self._STALE_AFTER_SECONDS
+        self._last_react_at = {k: v for k, v in self._last_react_at.items() if v >= cutoff}
+        self._last_bystander_at = {k: v for k, v in self._last_bystander_at.items() if v >= cutoff}
+        self._last_proactive_at_chat = {
+            k: v for k, v in self._last_proactive_at_chat.items() if v >= cutoff
+        }
+        self._poke_records = defaultdict(
+            lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN),
+            {k: v for k, v in self._poke_records.items() if v and v[-1] >= cutoff},
+        )
+        while self._reaction_window and self._reaction_window[0] < cutoff:
+            self._reaction_window.popleft()
+        now = time.time()
+        self._name_cache = {k: v for k, v in self._name_cache.items() if v[1] >= now}
+        self._stream_id_cache = {k: v for k, v in self._stream_id_cache.items() if v[1] >= now}
+        # 与 _last_proactive_at_chat 同源 prune：3600s 没主动戳过的群锁可清；
+        # 但 lock.locked()=True 时仍跳过，避免移除"正持有中"的锁导致同群双发
+        active_groups = set(self._last_proactive_at_chat.keys())
+        self._proactive_locks = {
+            gid: lock for gid, lock in self._proactive_locks.items()
+            if gid in active_groups or lock.locked()
+        }
+
+    def clear(self) -> None:
+        self._last_react_at.clear()
+        self._poke_records.clear()
+        self._last_bystander_at.clear()
+        self._name_cache.clear()
+        self._stream_id_cache.clear()
+        self._last_proactive_at_chat.clear()
+        self._last_proactive_global_at = 0.0
+        self._proactive_daily_count = 0
+        self._proactive_daily_date = ""
+        self._reaction_window.clear()
+        self._record_counter = 0
+        self._proactive_locks.clear()
+        self._known_self_id = ""
