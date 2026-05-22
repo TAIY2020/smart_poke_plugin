@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.5.0"
+CONFIG_SCHEMA_VERSION = "1.6.0"
 
 
 # --- 配置模型 ---
@@ -42,6 +42,16 @@ class PluginSection(PluginConfigBase):
         default=True,
         description="是否启用插件",
         json_schema_extra={"label": "启用插件"},
+    )
+    record_self_poke_to_context: bool = Field(
+        default=False,
+        description=(
+            "是否把这次戳行为追加到对应聊天流的 "
+        ),
+        json_schema_extra={
+            "label": "[实验性] 把自己的戳写入上下文",
+            "hint": "默认关闭；若开启会通过硬性「系统事件」前缀 + 第三人称 + 显式禁止复述指令降低风险",
+        },
     )
 
 

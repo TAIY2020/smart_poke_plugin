@@ -264,6 +264,87 @@ class SmartPokePlugin(MaiBotPlugin):
             return await self.resolve_stream_id_for_user(ctx.poker_id)
         return ""
 
+    # ===== Maisaka 上下文注入 =====
+
+    _SELF_POKE_ACTION_LABELS = {
+        "back_poke": "回戳了",
+        "bystander": "跟风戳了",
+        "proactive": "主动戳了",
+    }
+
+    async def record_self_poke_to_context(
+        self,
+        *,
+        label: str,
+        target_id: str,
+        target_name: str,
+        group_id: str,
+        is_group: bool,
+        stream_id: str = "",
+    ) -> None:
+        """把 bot 自己发出的戳行为追加到对应聊天流的 Maisaka 上下文。
+
+        失败仅 debug 不抛——记忆写入失败的严重度低于戳没出去。
+        """
+        if not self.config.plugin.record_self_poke_to_context:
+            return
+        if not target_id:
+            return
+
+        if not stream_id:
+            # notify 路径下 ctx.stream_id 常为空，按群/用户回查
+            if is_group and group_id:
+                stream_id = await self.resolve_stream_id_for_group(group_id)
+            else:
+                stream_id = await self.resolve_stream_id_for_user(target_id)
+        if not stream_id:
+            self.ctx.logger.debug(
+                "[%s] 无法解析 stream_id，跳过 Maisaka 上下文注入 (group=%s, target=%s)",
+                label, group_id, target_id,
+            )
+            return
+
+        action = self._SELF_POKE_ACTION_LABELS.get(label, "戳了戳")
+        display_name = (target_name or "").strip() or target_id
+
+        text = (
+            f"[系统事件] 我刚刚通过 QQ 的「戳一戳」功能{action} \"{display_name}\"。"
+        )
+
+        try:
+            resp = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "content": text}],
+                visible_text=text,
+                source_kind=f"plugin:smart_poke:{label}",
+            )
+        except Exception:
+            self.ctx.logger.warning(
+                "[%s] maisaka.context.append 调用异常 (stream=%s)",
+                label, stream_id, exc_info=True,
+            )
+            return
+
+        # host 业务失败统一回 {"success": False, "error": ...}；成功则带 index/visible_text/source_kind
+        if isinstance(resp, dict) and resp.get("success") is False:
+            self.ctx.logger.warning(
+                "[%s] maisaka.context.append 业务失败 (stream=%s): %s",
+                label, stream_id, resp.get("error"),
+            )
+            return
+
+        # 成功时打 info 让用户在日志里能肉眼确认"这次戳已写入麦麦上下文"
+        if isinstance(resp, dict) and resp.get("success") is True:
+            self.ctx.logger.info(
+                "[%s] 已写入 Maisaka 上下文: text=%r, index=%s, stream=%s",
+                label, resp.get("visible_text") or text,
+                resp.get("index"), stream_id,
+            )
+        else:
+            self.ctx.logger.debug(
+                "[%s] maisaka.context.append 返回了非预期结构: %r", label, resp,
+            )
+
     # ===== Hook 入口 =====
 
     @HookHandler(

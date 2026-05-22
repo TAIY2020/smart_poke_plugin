@@ -198,6 +198,16 @@ class ReactionExecutor:
                 "[back_poke] 连戳 %d 次 (is_spam=%s, max=%d)",
                 times, is_spam, max_times,
             )
+        # 连戳成功 N 次只注入一条，避免 Replyer 上下文里堆 N 条「我回戳了 X」噪音
+        if any_success:
+            await plugin.record_self_poke_to_context(
+                label="back_poke",
+                target_id=ctx.poker_id,
+                target_name=ctx.poker_name,
+                group_id=ctx.group_id,
+                is_group=ctx.is_group,
+                stream_id=ctx.stream_id,
+            )
         return any_success
 
     async def _send_text(self, stream_id: str, is_spam: bool) -> bool:

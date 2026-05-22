@@ -94,3 +94,18 @@ class BystanderPoker:
                 cfg.target_strategy,
                 target_label, ctx.poker_name or ctx.poker_id, ctx.target_name or ctx.target_id,
             )
+            # target 是 victim 时用已解析的 target_name；是 poker 时用 poker_name；都不命中传空让上层走 resolve
+            if target_id == ctx.target_id:
+                injected_name = ctx.target_name
+            elif target_id == ctx.poker_id:
+                injected_name = ctx.poker_name
+            else:
+                injected_name = ""
+            await plugin.record_self_poke_to_context(
+                label="bystander",
+                target_id=target_id,
+                target_name=injected_name,
+                group_id=ctx.group_id,
+                is_group=ctx.is_group,
+                stream_id=ctx.stream_id,
+            )

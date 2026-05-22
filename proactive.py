@@ -195,6 +195,15 @@ class ProactivePoker:
                 "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",
                 cfg.target_strategy, group_id, target_name or target_id,
             )
+            # 复用 _maybe_poke 里已 resolve 的 stream_id，省一次缓存查
+            await plugin.record_self_poke_to_context(
+                label="proactive",
+                target_id=target_id,
+                target_name=target_name,
+                group_id=group_id,
+                is_group=True,
+                stream_id=stream_id,
+            )
 
     # ===== 目标挑选 =====
 
