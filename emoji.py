@@ -191,8 +191,14 @@ class EmojiKeywordValidator:
     # ===== 内部 =====
 
     def _sample_probe_keywords(self, keywords: list[str]) -> list[str]:
-        """采样关键词：已验证的优先，未验证的作为表情库新增的刷新机制混入。"""
-        cleaned = [str(k).strip() for k in keywords if str(k).strip()]
+        """采样关键词：已验证的优先，未验证的作为表情库新增的刷新机制混入。
+
+        先 ``dict.fromkeys`` 去重：用户在配置中误填重复关键词时，否则同一关键词会
+        被多次 RPC 探测，miss 时计数翻倍增长导致该词被过早移出验证集。
+        """
+        cleaned = list(dict.fromkeys(
+            str(k).strip() for k in keywords if str(k).strip()
+        ))
         if not cleaned:
             return []
         validated_set = set(self._validated_keywords)
