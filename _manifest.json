@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.6.3",
+  "version": "1.6.4",
   "name": "智能戳一戳插件 | Smart Poke Plugin",
   "description": "一个让麦麦在 QQ 戳一戳里尽量像真人一样反应的拟人化交互插件。",
   "author": {
@@ -41,6 +41,13 @@
     "supported_locales": [
       "zh-CN"
     ]
+  },
+  "plugin_type": "game",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "./poke.webp"
+    }
   },
   "id": "TAIY2020.smart_poke_plugin"
 }

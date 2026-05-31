@@ -78,7 +78,7 @@ class ReactionSection(PluginConfigBase):
         },
     )
     back_poke_weight: float = Field(
-        default=0.5,
+        default=0.6,
         ge=0.0,
         le=1.0,
         description="反应时选择回戳的权重；三种权重按总和归一化，不要求加起来等于 1",
@@ -92,7 +92,7 @@ class ReactionSection(PluginConfigBase):
         },
     )
     emoji_weight: float = Field(
-        default=0.3,
+        default=0.2,
         ge=0.0,
         le=1.0,
         description="反应时选择发表情包的权重；三种权重按总和归一化，不要求加起来等于 1",
@@ -314,7 +314,7 @@ class BystanderSection(PluginConfigBase):
         },
     )
     probability: float = Field(
-        default=0.85,
+        default=0.6,
         ge=0.0,
         le=1.0,
         description="别人互戳时麦麦跟风戳的概率",
@@ -346,7 +346,7 @@ class BystanderSection(PluginConfigBase):
         },
     )
     cooldown_seconds: int = Field(
-        default=30,
+        default=60,
         ge=0,
         le=600,
         description="同一聊天的跟风戳冷却（独立于戳麦麦的冷却）",
@@ -410,7 +410,7 @@ class ProactiveSection(PluginConfigBase):
         },
     )
     probability: float = Field(
-        default=0.02,
+        default=0.035,
         ge=0.0,
         le=1.0,
         description=(
