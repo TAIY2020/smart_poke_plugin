@@ -31,6 +31,7 @@
 
 - **MaiBot 主程序**: v1.0.0+
 - **MaiBot SDK**: v2.0.0+
+- **MaiBot-Napcat-Adapter**：部分功能依赖 MaiBot-Napcat-Adapter
 
 ### 3. 配置
 
