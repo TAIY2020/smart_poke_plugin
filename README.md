@@ -37,74 +37,6 @@
 
 首次启动麦麦后，插件会在其目录下自动生成 `config.toml` 文件，开箱即用。**推荐通过 Web UI 在线修改配置**，修改后会自动热重载生效；下面的字段名仅供进阶用户直接编辑配置文件时参考。
 
-**默认配置示例**:
-
-```toml
-[plugin]
-name = "smart_poke_plugin"
-config_version = "1.5.0"
-enabled = true
-
-[reaction]
-react_probability = 0.85
-back_poke_weight = 0.5
-emoji_weight = 0.3
-text_weight = 0.1
-silent_chat_probability = 0.1
-swallow_when_silent = true
-min_delay_seconds = 1.0
-max_delay_seconds = 2.5
-cooldown_seconds = 8
-max_reactions_per_minute = 6
-back_poke_max_times = 3
-spam_threshold = 5
-spam_window_seconds = 45
-react_in_group = true
-react_in_private = true
-
-[fallback]
-normal_replies = ["干嘛戳我", "戳什么戳", "干啥"]
-spam_replies = ["你戳够了没", "好烦别戳了", "你是不是没事干", "停！手！", "烦不烦", "SB吧"]
-silent_replies = ["...", "？？？", "，，，"]
-
-[user_control]
-blacklist = []
-ignore_self_poke = true
-
-[emoji]
-description_keywords = ["疑惑", "无奈", "生气", "无语", "哼", "瞪"]
-allow_random_fallback = false
-
-[bystander]
-enabled = true
-probability = 0.85
-target_strategy = "victim"
-cooldown_seconds = 30
-swallow_event = false
-min_delay_seconds = 1.5
-max_delay_seconds = 4.0
-
-[proactive]
-enabled = true
-probability = 0.02
-active_hour_start = 9
-active_hour_end = 24
-per_chat_cooldown_seconds = 600
-global_cooldown_seconds = 90
-max_pokes_per_day = 3
-lookback_seconds = 1800
-recent_window_seconds = 300
-recent_fetch_limit = 100
-min_recent_messages = 3
-respect_spam_history = true
-respect_spam_window_seconds = 600
-target_strategy = "active_speaker"
-min_delay_seconds = 2.0
-max_delay_seconds = 6.0
-whitelist_groups = []
-blacklist_groups = []
-```
-
 **⚠️ 重要安全提示**（Web UI 同名项）:
 
 - **「黑名单 QQ」**: 黑名单 QQ 号字符串列表。被列入的人戳麦麦会被静默忽略；跟风戳和主动戳也都不会戳到他们。例如：`["12345", "67890"]`。
@@ -169,8 +101,8 @@ blacklist_groups = []
 | 配置项（Web UI / TOML） | 默认值 | 说明 |
 | ------ | ------ | ---- |
 | 反应概率（`react_probability`） | `0.85` | 被戳时做出反应的概率，越大越爱搭理 |
-| 回戳权重（`back_poke_weight`） | `0.5` | 反应里"回戳"的权重 |
-| 表情权重（`emoji_weight`） | `0.3` | 反应里"表情包"的权重 |
+| 回戳权重（`back_poke_weight`） | `0.6` | 反应里"回戳"的权重 |
+| 表情权重（`emoji_weight`） | `0.2` | 反应里"表情包"的权重 |
 | 文字权重（`text_weight`） | `0.1` | 反应里"文字"的权重（三个权重不要求加起来等于 1） |
 | 沉默时发言概率（`silent_chat_probability`） | `0.1` | 装作没看见时偶尔嘀咕一句的概率 |
 | 沉默时吞事件（`swallow_when_silent`） | `true` | 沉默时是否完全吞掉事件；关闭后会把事件放行给主程序自带的回应 |
@@ -211,9 +143,9 @@ blacklist_groups = []
 | 配置项（Web UI / TOML） | 默认值 | 说明 |
 | ------ | ------ | ---- |
 | 启用跟风戳（`enabled`） | `true` | 是否启用跟风戳 |
-| 跟风戳概率（`probability`） | `0.85` | 跟风戳触发概率 |
+| 跟风戳概率（`probability`） | `0.35` | 跟风戳触发概率 |
 | 目标策略（`target_strategy`） | `戳被戳者` | 跟风目标：戳被戳者 / 戳发起者 / 随机选一个 |
-| 跟风冷却（秒）（`cooldown_seconds`） | `30` | 跟风戳冷却时长 |
+| 跟风冷却（秒）（`cooldown_seconds`） | `60` | 跟风戳冷却时长 |
 | 跟风时吞事件（`swallow_event`） | `false` | 跟风时是否吞掉这次互戳事件 |
 | 最小延迟（秒）（`min_delay_seconds`） | `1.5` | 跟风戳思考延迟下限 |
 | 最大延迟（秒）（`max_delay_seconds`） | `4.0` | 跟风戳思考延迟上限 |
@@ -223,7 +155,7 @@ blacklist_groups = []
 | 配置项（Web UI / TOML） | 默认值 | 说明 |
 | ------ | ------ | ---- |
 | 启用主动戳（`enabled`） | `true` | 是否启用主动戳（仅群聊） |
-| 出手概率（`probability`） | `0.02` | 每条群消息触发主动戳的基础概率，建议 0.01~0.05 |
+| 出手概率（`probability`） | `0.035` | 每条群消息触发主动戳的基础概率，建议 0.01~0.05 |
 | 活跃时段开始（小时）（`active_hour_start`） | `9` | 主动戳活跃时段起点（24h 制） |
 | 活跃时段结束（小时）（`active_hour_end`） | `24` | 主动戳活跃时段终点（24h 制，支持跨午夜） |
 | 同群冷却（秒）（`per_chat_cooldown_seconds`） | `600` | 同一群两次主动戳的最小间隔 |

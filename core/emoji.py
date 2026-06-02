@@ -119,7 +119,9 @@ class EmojiKeywordValidator:
                     "emoji 关键词探测 RPC 失败 (kw=%s)", kw, exc_info=True
                 )
                 continue
-            if isinstance(emoji, dict) and emoji:
+            # 失败信封无 base64 键，必须用实际内容字段判命中，
+            # 否则会把 RPC 异常误当成"找到表情"而污染验证集。
+            if isinstance(emoji, dict) and emoji.get("base64"):
                 validated_via_rpc.append(kw)
         if validated_via_rpc:
             for kw in validated_via_rpc:
@@ -153,7 +155,10 @@ class EmojiKeywordValidator:
         for kw in probe:
             try:
                 emoji = await ctx.emoji.get_by_description(kw, limit=1)
-                if isinstance(emoji, dict) and emoji:
+                # 用 base64 而非"非空 dict"判命中：Host 抛异常时返回的失败信封
+                # {"success": False, ...} 是非空 dict 但无 base64，误判会污染验证集、
+                # 提前 return 错误信封并跳过随机兜底。
+                if isinstance(emoji, dict) and emoji.get("base64"):
                     if kw not in self._validated_keywords:
                         self._validated_keywords.append(kw)
                     self._miss_counts.pop(kw, None)
@@ -180,9 +185,10 @@ class EmojiKeywordValidator:
             emojis = await ctx.emoji.get_random(1)
             if isinstance(emojis, list):
                 for item in emojis:
-                    if isinstance(item, dict) and item:
+                    if isinstance(item, dict) and item.get("base64"):
                         return item
-            elif isinstance(emojis, dict) and emojis:
+            # get_random 正常返回 list；返回 dict 只可能是失败信封，用 base64 将其排除
+            elif isinstance(emojis, dict) and emojis.get("base64"):
                 return emojis
         except Exception:
             ctx.logger.debug("emoji.get_random 失败", exc_info=True)

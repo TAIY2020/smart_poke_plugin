@@ -239,8 +239,10 @@ class ReactionExecutor:
 
     async def _safe_send_text(self, text: str, stream_id: str) -> bool:
         try:
-            await self._plugin.ctx.send.text(text, stream_id)
-            return True
+            # ctx.send.text 在发送业务失败时返回 False（不抛异常），必须接住返回值，
+            # 否则级联回退（文字失败→回退回戳）会因误判成功而失效。
+            ok = await self._plugin.ctx.send.text(text, stream_id)
+            return bool(ok)
         except Exception:
             self._plugin.ctx.logger.exception("发送文字回复失败")
             return False
@@ -257,8 +259,10 @@ class ReactionExecutor:
             if not isinstance(emoji_data, str) or not emoji_data:
                 return False
 
-            await plugin.ctx.send.emoji(emoji_data, stream_id)
-            return True
+            # 同 _safe_send_text：emoji 发送失败时 ctx.send.emoji 返回 False 而非抛异常，
+            # 接住返回值才能让 react_to_poke 正确回退到回戳/文字。
+            ok = await plugin.ctx.send.emoji(emoji_data, stream_id)
+            return bool(ok)
         except Exception:
             plugin.ctx.logger.exception("发送表情失败")
             return False
