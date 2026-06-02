@@ -314,7 +314,7 @@ class BystanderSection(PluginConfigBase):
         },
     )
     probability: float = Field(
-        default=0.6,
+        default=0.35,
         ge=0.0,
         le=1.0,
         description="别人互戳时麦麦跟风戳的概率",

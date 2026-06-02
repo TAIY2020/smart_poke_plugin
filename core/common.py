@@ -22,7 +22,7 @@ PROACTIVE_TASK_QUEUE_LIMIT = 64
 def _load_manifest_version() -> str:
     """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
     try:
-        manifest_path = Path(__file__).parent / "_manifest.json"
+        manifest_path = Path(__file__).resolve().parent.parent / "_manifest.json"
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         version = data.get("version")
         if isinstance(version, str) and version.strip():

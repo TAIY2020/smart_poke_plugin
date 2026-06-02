@@ -18,7 +18,7 @@ from .common import to_positive_int
 
 
 if TYPE_CHECKING:
-    from .plugin import SmartPokePlugin
+    from ..plugin import SmartPokePlugin
 
 
 # 同 label 的失败在该窗口内只打一条 warning；其余降级为 debug。

@@ -5,14 +5,14 @@
 另以 OBSERVE 模式观察普通消息，按概率触发主动戳。
 
 本文件为薄入口：仅持有 config schema 绑定、生命周期与两个 Hook 的入口派发。
-具体执行链拆在以下 deep module：
+具体执行链拆在 ``core`` 子包：
 
-* ``state.PokeStateManager`` —— 冷却/计数/缓存的集中持有者
-* ``napcat.NapcatPokeClient`` —— ``send_poke`` 调用 + 失败日志抑制
-* ``emoji.EmojiKeywordValidator`` —— 关键词探测 + 衰退 + 选表情
-* ``reaction.ReactionExecutor`` —— 戳到麦麦的反应主流程（poke / emoji / text）
-* ``bystander.BystanderPoker`` —— 别人互戳时跟风
-* ``proactive.ProactivePoker`` —— 群消息观察 + 主动戳完整链路
+* ``core.state.PokeStateManager`` —— 冷却/计数/缓存的集中持有者
+* ``core.napcat.NapcatPokeClient`` —— ``send_poke`` 调用 + 失败日志抑制
+* ``core.emoji.EmojiKeywordValidator`` —— 关键词探测 + 衰退 + 选表情
+* ``core.reaction.ReactionExecutor`` —— 戳到麦麦的反应主流程（poke / emoji / text）
+* ``core.bystander.BystanderPoker`` —— 别人互戳时跟风
+* ``core.proactive.ProactivePoker`` —— 群消息观察 + 主动戳完整链路
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ from typing import Any
 from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
-from .bystander import BystanderPoker
-from .common import PLUGIN_VERSION, PROACTIVE_TASK_QUEUE_LIMIT, to_positive_int
-from .config import SmartPokeConfig
-from .emoji import EmojiKeywordValidator
-from .napcat import NapcatPokeClient
-from .proactive import ProactivePoker
-from .reaction import ReactionExecutor
-from .state import (
+from .core.bystander import BystanderPoker
+from .core.common import PLUGIN_VERSION, PROACTIVE_TASK_QUEUE_LIMIT, to_positive_int
+from .core.config import SmartPokeConfig
+from .core.emoji import EmojiKeywordValidator
+from .core.napcat import NapcatPokeClient
+from .core.proactive import ProactivePoker
+from .core.reaction import ReactionExecutor
+from .core.state import (
     MEMBER_NAME_CACHE_TTL_SECONDS,
     MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS,
     STREAM_ID_CACHE_TTL_SECONDS,

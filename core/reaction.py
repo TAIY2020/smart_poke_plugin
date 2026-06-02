@@ -18,7 +18,7 @@ from .state import PokeContext
 
 
 if TYPE_CHECKING:
-    from .plugin import SmartPokePlugin
+    from ..plugin import SmartPokePlugin
 
 
 class ReactionExecutor:

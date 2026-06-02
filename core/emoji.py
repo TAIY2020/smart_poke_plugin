@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 
 if TYPE_CHECKING:
-    from .plugin import SmartPokePlugin
+    from ..plugin import SmartPokePlugin
 
 
 # 表情库未就绪时 get_by_description 会在主程序里打 "[获取表情包] 表情包列表为空" warning，

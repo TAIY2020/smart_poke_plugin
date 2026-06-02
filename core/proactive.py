@@ -23,7 +23,7 @@ from .common import format_local_date, in_active_hours, to_positive_int
 
 
 if TYPE_CHECKING:
-    from .plugin import SmartPokePlugin
+    from ..plugin import SmartPokePlugin
 
 
 class ProactivePoker:
