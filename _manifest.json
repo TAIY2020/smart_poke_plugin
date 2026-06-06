@@ -42,12 +42,5 @@
       "zh-CN"
     ]
   },
-  "plugin_type": "game",
-  "display": {
-    "icon": {
-      "type": "local",
-      "value": "./assets/icon.webp"
-    }
-  },
   "id": "TAIY2020.smart_poke_plugin"
 }

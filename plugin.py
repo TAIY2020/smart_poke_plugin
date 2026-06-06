@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from pathlib import Path
 from typing import Any
 
 from maibot_sdk import HookHandler, MaiBotPlugin
@@ -73,6 +74,7 @@ class SmartPokePlugin(MaiBotPlugin):
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
+        self._ensure_config_file()
         self._refresh_user_sets()
         self.ctx.logger.info("智能戳一戳插件(v%s)初始化完成。", PLUGIN_VERSION)
         self._spawn_background_task(
@@ -107,6 +109,52 @@ class SmartPokePlugin(MaiBotPlugin):
         self._proactive_blacklist_groups = {
             str(x).strip() for x in cfg.proactive.blacklist_groups if str(x).strip()
         }
+
+    def _ensure_config_file(self) -> None:
+        """确保 config.toml 文件存在；不存在时根据 config_model 生成默认配置文件。
+
+        MaiBot SDK v2 不会自动在磁盘上创建 config.toml，仅在内存中生成默认配置。
+        插件需要自行检查并创建配置文件，否则用户首次启动后无法通过 Web UI 编辑配置。
+        """
+        config_path = Path(__file__).resolve().parent / "config.toml"
+        if config_path.exists():
+            return
+
+        try:
+            default_config = self.get_default_config()
+            if not default_config:
+                self.ctx.logger.warning("无法获取默认配置，跳过 config.toml 创建")
+                return
+
+            toml_content = self._dict_to_toml(default_config)
+            config_path.write_text(toml_content, encoding="utf-8")
+            self.ctx.logger.info("已自动生成默认配置文件: %s", config_path)
+        except Exception:
+            self.ctx.logger.exception("创建 config.toml 失败")
+
+    @staticmethod
+    def _dict_to_toml(data: dict, prefix: str = "") -> str:
+        """将嵌套字典转换为 TOML 格式字符串。
+
+        简单实现，支持 str/int/float/bool/list[str] 和嵌套 dict 基本类型，
+        足以覆盖 SmartPokeConfig 的所有字段。
+        """
+        lines: list[str] = []
+        sections: list[tuple[str, dict]] = []
+
+        for key, value in data.items():
+            if isinstance(value, dict):
+                section_key = f"{prefix}.{key}" if prefix else key
+                sections.append((section_key, value))
+            else:
+                lines.append(f"{key} = {_toml_value(value)}")
+
+        for section_key, section_data in sections:
+            lines.append("")
+            lines.append(f"[{section_key}]")
+            lines.append(SmartPokePlugin._dict_to_toml(section_data, section_key))
+
+        return "\n".join(lines) + "\n"
 
     # ===== 后台任务调度 =====
 
@@ -529,3 +577,24 @@ class SmartPokePlugin(MaiBotPlugin):
 def create_plugin() -> SmartPokePlugin:
     """Runner 调用入口。"""
     return SmartPokePlugin()
+
+
+def _toml_value(value: Any) -> str:
+    """将 Python 值转换为 TOML 格式的字符串表示。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        items = [_toml_value(v) for v in value]
+        return "[" + ", ".join(items) + "]"
+    if value is None:
+        return '""'
+    return f'"{value}"'
