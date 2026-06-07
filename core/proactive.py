@@ -47,13 +47,27 @@ class ProactivePoker:
         info = self._extract_signal(message)
         if info is None:
             return
-        # 概率骰子提前到派发前：未中签的群消息直接 return，避免占用
-        # PROACTIVE_TASK_QUEUE_LIMIT 队列槽位空跑一次 _maybe_poke。
+        # 主动戳观察是高频路径：顺带按时间节流触发一次状态清理（O(1) 检查，实际 _prune
+        # 最快每 _PRUNE_MIN_INTERVAL_SECONDS 一次），避免"只主动戳、很少有人戳麦麦"的
+        # 环境下 _prune 长期不跑、_proactive_locks 等随群数累积。
+        plugin._state.maybe_prune()
+        group_id, speaker_id = info
+        # 群级名单只依赖 group_id（O(1) set 查找），前移到派发前：名单外的群直接 return，
+        # 不必 spawn 一个进 _maybe_poke 立刻退出的空任务、白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。
+        # 黑名单优先；白名单非空时只放行名单内的群。
+        if group_id in plugin._proactive_blacklist_groups:
+            return
+        if plugin._proactive_whitelist_groups and group_id not in plugin._proactive_whitelist_groups:
+            return
+        # 概率骰子提前到派发前：未中签的群消息直接 return，避免占用队列槽位空跑 _maybe_poke。
         if cfg.probability <= 0:
             return
         if random.random() > cfg.probability:
             return
-        group_id, speaker_id = info
+        # 活跃时段判定带 localtime 开销，放在概率命中之后、仅对入选消息计算（同样前移以免空跑任务）。
+        now_struct = time.localtime()
+        if not in_active_hours(cfg.active_hour_start, cfg.active_hour_end, now_struct.tm_hour):
+            return
         plugin._spawn_background_task(
             self._maybe_poke(group_id, speaker_id), "proactive"
         )
@@ -114,18 +128,14 @@ class ProactivePoker:
         plugin = self._plugin
         cfg = plugin.config.proactive
 
-        # ----- 锁外早期过滤 -----
-        # probability 骰子已在 observe_signal 派发前完成，这里不再重复。
-        now_struct = time.localtime()
-        if not in_active_hours(cfg.active_hour_start, cfg.active_hour_end, now_struct.tm_hour):
-            return
-        if group_id in plugin._proactive_blacklist_groups:
-            return
-        if plugin._proactive_whitelist_groups and group_id not in plugin._proactive_whitelist_groups:
-            return
+        # 概率骰子、群黑/白名单、活跃时段判定都已在 observe_signal 派发前完成
+        # （三者均只依赖 group_id，前移可避免为注定 return 的触发 spawn 出空任务），这里不再重复。
 
         target_id: str = ""
         target_name: str = ""
+        # begin_proactive_inflight 发的令牌；仅在锁内成功 begin 后才会走到锁外 try，
+        # 届时必为有效值(>0)，此处初始化只为静态可读性与防御。
+        inflight_token: int = 0
 
         async with plugin._state.get_proactive_lock(group_id):
             # 全局冷却是乐观快检，原子性靠后续 _proactive_global_lock 内的二次确认保障
@@ -165,6 +175,17 @@ class ProactivePoker:
                 return
             if not target_id:
                 return
+            # 兜底防自戳：_pick_target 已用 known_self_id 过滤 bot 自己的消息，但
+            # self_id 学到之前的极端窗口里 bot 自己仍可能成为候选；这里在消耗
+            # 冷却/日上限（mark_proactive）之前再挡一道，避免戳到自己后触发
+            # ignore_self_poke 回声、白白浪费一次主动戳配额。
+            known_self_id = plugin._state.get_known_self_id()
+            if known_self_id and target_id == known_self_id:
+                plugin.ctx.logger.debug(
+                    "[proactive] 目标解析为 bot 自身 (self_id=%s)，跳过本次主动戳",
+                    known_self_id,
+                )
+                return
 
             async with plugin._proactive_global_lock:
                 if plugin._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
@@ -173,37 +194,50 @@ class ProactivePoker:
                     already = plugin._state.proactive_daily_count(today)
                     if already >= cfg.max_pokes_per_day:
                         return
-                plugin._state.mark_proactive(group_id, today)
+                # 锁内只预占 in-flight 防并发双发；每日额度与群/全局长冷却推迟到
+                # send_poke 成功后再由 commit_proactive 计入，避免风控/超时/取消时
+                # "没戳出去却扣了配额"。in-flight 期间其他群的并发任务会在此退避。
+                # 传思考延迟上限做动态 TTL，并接住令牌供 commit/abort 防误清。
+                inflight_token = plugin._state.begin_proactive_inflight(cfg.max_delay_seconds)
 
         # ----- 锁外：思考延迟 + 出手 -----
-        lo = max(0.0, cfg.min_delay_seconds)
-        hi = max(lo, cfg.max_delay_seconds)
-        delay = random.uniform(lo, hi) if hi > 0 else 0
-        if delay > 0:
-            await asyncio.sleep(delay)
+        committed = False
+        try:
+            lo = max(0.0, cfg.min_delay_seconds)
+            hi = max(lo, cfg.max_delay_seconds)
+            delay = random.uniform(lo, hi) if hi > 0 else 0
+            if delay > 0:
+                await asyncio.sleep(delay)
 
-        if not target_name:
-            resolved = await plugin.resolve_member_name(group_id, target_id)
-            if resolved:
-                target_name = resolved
+            if not target_name:
+                resolved = await plugin.resolve_member_name(group_id, target_id)
+                if resolved:
+                    target_name = resolved
 
-        ok = await plugin._napcat.send_poke(
-            target_id, group_id, is_group=True, label="proactive",
-        )
-        if ok:
-            plugin.ctx.logger.info(
-                "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",
-                cfg.target_strategy, group_id, target_name or target_id,
+            ok = await plugin._napcat.send_poke(
+                target_id, group_id, is_group=True, label="proactive",
             )
-            # 复用 _maybe_poke 里已 resolve 的 stream_id，省一次缓存查
-            await plugin.record_self_poke_to_context(
-                label="proactive",
-                target_id=target_id,
-                target_name=target_name,
-                group_id=group_id,
-                is_group=True,
-                stream_id=stream_id,
-            )
+            if ok:
+                # 发送成功，正式占用每日额度与群/全局长冷却（令牌匹配时顺带清 in-flight）
+                plugin._state.commit_proactive(group_id, today, inflight_token)
+                committed = True
+                plugin.ctx.logger.info(
+                    "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",
+                    cfg.target_strategy, group_id, target_name or target_id,
+                )
+                # 复用 _maybe_poke 里已 resolve 的 stream_id，省一次缓存查
+                await plugin.record_self_poke_to_context(
+                    label="proactive",
+                    target_id=target_id,
+                    target_name=target_name,
+                    group_id=group_id,
+                    is_group=True,
+                    stream_id=stream_id,
+                )
+        finally:
+            if not committed:
+                # 失败/异常/取消：释放 in-flight 并留一小段全局失败退避，不消耗每日额度
+                plugin._state.abort_proactive_inflight(inflight_token)
 
     # ===== 目标挑选 =====
 
@@ -226,12 +260,11 @@ class ProactivePoker:
         self_id = plugin._state.get_known_self_id()
 
         active_count = 0
+        # 每个 uid 只保留其"最新一条消息"的 (ts, uname)，靠 ts 比较实现，
+        # 不依赖 message.get_recent 的返回顺序（正序 / 倒序都得到同一结果）。
         candidates: dict[str, tuple[float, str]] = {}
-        latest_speaker_id = ""
-        latest_speaker_name = ""
 
-        # message.get_recent 通常按时间正序返回，反向遍历以挑"最新说话者"
-        for msg in reversed(recent):
+        for msg in recent:
             if not isinstance(msg, dict):
                 continue
             if msg.get("is_notify"):
@@ -266,26 +299,20 @@ class ProactivePoker:
                 continue
 
             uname = str(user_info.get("user_cardname") or user_info.get("user_nickname") or "").strip()
-            if uid not in candidates:
+            existing = candidates.get(uid)
+            if existing is None or ts > existing[0]:
                 candidates[uid] = (ts, uname)
-            if not latest_speaker_id:
-                latest_speaker_id = uid
-                latest_speaker_name = uname
 
         if not candidates:
             return "", "", active_count
 
         if cfg.target_strategy == "active_speaker":
-            # speaker_id 被前面的过滤剔除时退到 latest_speaker_id；
-            # 再不行取候选里时间戳最新的那个让 active_speaker 在边界场景也成立
+            # 优先戳"勾起这次观察的说话人"；它被前面的过滤剔除（如最近戳过麦麦）时，
+            # 退到候选里时间戳最新的那个，让 active_speaker 在边界场景也成立。
             if speaker_id in candidates:
                 _ts, uname = candidates[speaker_id]
                 return speaker_id, uname, active_count
-            if latest_speaker_id and latest_speaker_id in candidates:
-                return latest_speaker_id, latest_speaker_name, active_count
-            uid, (_ts, uname) = max(
-                candidates.items(), key=lambda kv: kv[1][0]
-            )
+            uid, (_ts, uname) = max(candidates.items(), key=lambda kv: kv[1][0])
             return uid, uname, active_count
 
         uid = random.choice(list(candidates.keys()))

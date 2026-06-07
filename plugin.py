@@ -54,6 +54,8 @@ class SmartPokePlugin(MaiBotPlugin):
         self._proactive_whitelist_groups: set[str] = set()
         self._proactive_blacklist_groups: set[str] = set()
         self._pending_tasks: set[asyncio.Task] = set()
+        # emoji 关键词探测任务句柄：热更新时取消上一轮未结束的探测，避免累积并发长轮询。
+        self._emoji_probe_task: asyncio.Task | None = None
         self._state = PokeStateManager()
         # global 锁保护"全局冷却二次确认 + mark"临界区，避免不同群并发任务都穿过乐观快检。
         # per-group 锁挂在 self._state.get_proactive_lock(group_id)，与 _last_proactive_at_chat
@@ -73,11 +75,10 @@ class SmartPokePlugin(MaiBotPlugin):
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
+        self._shutting_down = False
         self._refresh_user_sets()
         self.ctx.logger.info("智能戳一戳插件(v%s)初始化完成。", PLUGIN_VERSION)
-        self._spawn_background_task(
-            self._emoji.probe_keywords_at_startup(), "emoji_keyword_probe"
-        )
+        self._spawn_emoji_probe()
 
     async def on_unload(self) -> None:
         # 拒收新任务后再 cancel/gather，避免 gather 完成后又有"漏网之鱼"被孤立
@@ -88,6 +89,7 @@ class SmartPokePlugin(MaiBotPlugin):
         if to_cancel:
             await asyncio.gather(*to_cancel, return_exceptions=True)
         self._pending_tasks.clear()
+        self._emoji_probe_task = None
         self._proactive_active_count = 0
         self._state.clear()  # 同时清掉 _state 内的 _proactive_locks
 
@@ -96,7 +98,9 @@ class SmartPokePlugin(MaiBotPlugin):
     ) -> None:
         if scope == "self":
             self._refresh_user_sets()
+            self._emoji.reset()
             self.ctx.logger.info("配置已热更新完成。")
+            self._spawn_emoji_probe()
 
     def _refresh_user_sets(self) -> None:
         cfg = self.config
@@ -110,14 +114,14 @@ class SmartPokePlugin(MaiBotPlugin):
 
     # ===== 后台任务调度 =====
 
-    def _spawn_background_task(self, coro: Any, label: str, timeout: float = 120.0) -> None:
+    def _spawn_background_task(self, coro: Any, label: str, timeout: float = 120.0) -> asyncio.Task | None:
         """提交后台任务，带超时兜底；卸载期或主动戳超并发时直接 close coroutine。"""
         if self._shutting_down:
             try:
                 coro.close()
             except Exception:
                 pass
-            return
+            return None
 
         is_proactive = label == "proactive"
         if is_proactive and self._proactive_active_count >= PROACTIVE_TASK_QUEUE_LIMIT:
@@ -129,7 +133,7 @@ class SmartPokePlugin(MaiBotPlugin):
                 "[proactive] 并发任务已达上限 %d，丢弃本次触发",
                 PROACTIVE_TASK_QUEUE_LIMIT,
             )
-            return
+            return None
 
         async def _runner() -> None:
             try:
@@ -151,6 +155,17 @@ class SmartPokePlugin(MaiBotPlugin):
                 self._proactive_active_count = max(0, self._proactive_active_count - 1)
 
         task.add_done_callback(_on_done)
+        return task
+
+    def _spawn_emoji_probe(self) -> None:
+        """启动表情关键词探测；先取消上一轮未结束的探测，避免热更新连续保存配置时
+        累积多个并发长轮询任务（表情库未就绪时单轮探测最长会轮询约 1 分钟）。"""
+        old = self._emoji_probe_task
+        if old is not None and not old.done():
+            old.cancel()
+        self._emoji_probe_task = self._spawn_background_task(
+            self._emoji.probe_keywords_at_startup(), "emoji_keyword_probe"
+        )
 
     # ===== 名字 / stream_id 解析（公开给协作模块复用，带 TTL 缓存）=====
 
@@ -208,23 +223,31 @@ class SmartPokePlugin(MaiBotPlugin):
             )
         return name
 
-    async def resolve_stream_id_for_group(self, group_id: str) -> str:
-        """根据群号查 stream_id（带 TTL 缓存）。"""
+    async def resolve_stream_id_for_group(self, group_id: str, *, allow_open: bool = False) -> str:
+        """根据群号查 stream_id（带 TTL 缓存）。
+
+        ``allow_open=True`` 时，若 chat_manager 尚无该群会话（get_stream_by_group_id
+        落空），回退 ``ctx.chat.open_session`` 打开/创建群聊流——覆盖"冷群从未建过流、
+        被戳后想回文字/表情却拿不到 stream_id"的边角场景。主动戳等只读路径保持默认
+        False，不在冷群上凭空创建会话。
+        """
         if not group_id:
             return ""
         cached = self._state.get_cached_stream_id(group_id=group_id, user_id="")
         if cached is not None:
             return cached
+        stream_id = ""
         try:
             stream = await self.ctx.chat.get_stream_by_group_id(group_id, platform="qq")
         except Exception:
             self.ctx.logger.debug(
                 "get_stream_by_group_id 失败 (group=%s)", group_id, exc_info=True
             )
-            return ""
-        stream_id = ""
+            stream = None
         if isinstance(stream, dict):
             stream_id = str(stream.get("session_id") or "")
+        if not stream_id and allow_open:
+            stream_id = await self._open_session_stream_id(chat_type="group", group_id=group_id)
         if stream_id:
             self._state.cache_stream_id(
                 group_id=group_id, user_id="", stream_id=stream_id,
@@ -232,23 +255,29 @@ class SmartPokePlugin(MaiBotPlugin):
             )
         return stream_id
 
-    async def resolve_stream_id_for_user(self, user_id: str) -> str:
-        """根据用户号查 stream_id（带 TTL 缓存）。"""
+    async def resolve_stream_id_for_user(self, user_id: str, *, allow_open: bool = False) -> str:
+        """根据用户号查 stream_id（带 TTL 缓存）。
+
+        ``allow_open=True`` 时 get_stream_by_user_id 落空会回退 ``ctx.chat.open_session``
+        打开/创建私聊流，语义同 :meth:`resolve_stream_id_for_group`。
+        """
         if not user_id:
             return ""
         cached = self._state.get_cached_stream_id(group_id="", user_id=user_id)
         if cached is not None:
             return cached
+        stream_id = ""
         try:
             stream = await self.ctx.chat.get_stream_by_user_id(user_id, platform="qq")
         except Exception:
             self.ctx.logger.debug(
                 "get_stream_by_user_id 失败 (user=%s)", user_id, exc_info=True
             )
-            return ""
-        stream_id = ""
+            stream = None
         if isinstance(stream, dict):
             stream_id = str(stream.get("session_id") or "")
+        if not stream_id and allow_open:
+            stream_id = await self._open_session_stream_id(chat_type="private", user_id=user_id)
         if stream_id:
             self._state.cache_stream_id(
                 group_id="", user_id=user_id, stream_id=stream_id,
@@ -256,21 +285,96 @@ class SmartPokePlugin(MaiBotPlugin):
             )
         return stream_id
 
-    async def resolve_stream_id_for_context(self, ctx: PokeContext) -> str:
-        """notice 消息 session_id 固定为空时按群/用户回查。"""
+    async def resolve_stream_id_for_context(self, ctx: PokeContext, *, allow_open: bool = False) -> str:
+        """优先用入站消息已带的 session_id；为空时再按群/用户回查。
+
+        旧实现假设 notice 的 session_id 固定为空而直接回查，但部分 notice 实际带了
+        有效 session_id，且 chat_manager 里未必存在对应 group session
+        (get_stream_by_group_id 遍历 chat_manager.sessions 找不到时返回 None)，
+        导致 react 拿不到 stream_id 时 emoji/text/llm 三档全部回退到 poke。
+        故优先采信 ctx.stream_id（与 record_self_poke_to_context 的取值口径一致）。
+        """
+        if ctx.stream_id:
+            return ctx.stream_id
         if ctx.is_group and ctx.group_id:
-            return await self.resolve_stream_id_for_group(ctx.group_id)
+            return await self.resolve_stream_id_for_group(ctx.group_id, allow_open=allow_open)
         if ctx.poker_id:
-            return await self.resolve_stream_id_for_user(ctx.poker_id)
+            return await self.resolve_stream_id_for_user(ctx.poker_id, allow_open=allow_open)
         return ""
+
+    async def _open_session_stream_id(
+        self, *, chat_type: str, group_id: str = "", user_id: str = ""
+    ) -> str:
+        """get_stream_by_* 落空时回退 ``ctx.chat.open_session`` 打开/创建会话，返回其 session_id。
+
+        open_session 不在 SDK 归一化白名单内，返回 Host 完整结果
+        （含 success / created / stream_id / session_id / stream）；失败信封 success=False。
+        失败仅 debug 并返回空串，由调用方按"无 stream_id"降级（如回退到回戳）。
+        """
+        try:
+            result = await self.ctx.chat.open_session(
+                platform="qq", chat_type=chat_type, group_id=group_id, user_id=user_id,
+            )
+        except Exception:
+            self.ctx.logger.debug(
+                "chat.open_session 调用异常 (chat_type=%s, group=%s, user=%s)",
+                chat_type, group_id, user_id, exc_info=True,
+            )
+            return ""
+        if not isinstance(result, dict):
+            return ""
+        if result.get("success") is False:
+            self.ctx.logger.debug(
+                "chat.open_session 业务失败 (chat_type=%s, group=%s, user=%s): %s",
+                chat_type, group_id, user_id, result.get("error"),
+            )
+            return ""
+        stream_id = str(result.get("session_id") or result.get("stream_id") or "")
+        if stream_id:
+            self.ctx.logger.debug(
+                "chat.open_session 已%s会话 (chat_type=%s, group=%s, user=%s, stream=%s)",
+                "创建" if result.get("created") else "命中",
+                chat_type, group_id, user_id, stream_id,
+            )
+        return stream_id
 
     # ===== Maisaka 上下文注入 =====
 
-    _SELF_POKE_ACTION_LABELS = {
-        "back_poke": "回戳了",
-        "bystander": "跟风戳了",
-        "proactive": "主动戳了",
-    }
+    async def _append_self_event_to_context(
+        self, *, stream_id: str, text: str, label: str
+    ) -> None:
+        """底层：把一条文本事件追加进 Maisaka 上下文，统一异常 / resp 处理与日志。"""
+        try:
+            resp = await self.ctx.maisaka.context.append(
+                stream_id=stream_id,
+                segments=[{"type": "text", "content": text}],
+                visible_text=text,
+                source_kind=f"plugin:smart_poke:{label}",
+            )
+        except Exception:
+            self.ctx.logger.warning(
+                "[%s] maisaka.context.append 调用异常 (stream=%s)",
+                label, stream_id, exc_info=True,
+            )
+            return
+
+        # host 业务失败统一回 {"success": False, "error": ...}；成功则带 index/visible_text/source_kind
+        if isinstance(resp, dict) and resp.get("success") is False:
+            self.ctx.logger.warning(
+                "[%s] maisaka.context.append 业务失败 (stream=%s): %s",
+                label, stream_id, resp.get("error"),
+            )
+            return
+        if isinstance(resp, dict) and resp.get("success") is True:
+            self.ctx.logger.info(
+                "[%s] 已写入 Maisaka 上下文: text=%r, index=%s, stream=%s",
+                label, resp.get("visible_text") or text,
+                resp.get("index"), stream_id,
+            )
+        else:
+            self.ctx.logger.debug(
+                "[%s] maisaka.context.append 返回了非预期结构: %r", label, resp,
+            )
 
     async def record_self_poke_to_context(
         self,
@@ -304,46 +408,37 @@ class SmartPokePlugin(MaiBotPlugin):
             )
             return
 
-        action = self._SELF_POKE_ACTION_LABELS.get(label, "戳了戳")
         display_name = (target_name or "").strip() or target_id
+        # 用 QQ 原生戳一戳提示风格融入上下文，而非生硬的「系统事件」旁白；
+        # 整个 prompt 里 LLM 扮演麦麦，"我"即指麦麦，与"X戳了戳我"成对、语义清晰。
+        text = f"我戳了戳{display_name}"
 
-        text = (
-            f"[系统事件] 我刚刚通过 QQ 的「戳一戳」功能{action} \"{display_name}\"。"
+        await self._append_self_event_to_context(
+            stream_id=stream_id, text=text, label=label,
         )
 
-        try:
-            resp = await self.ctx.maisaka.context.append(
-                stream_id=stream_id,
-                segments=[{"type": "text", "content": text}],
-                visible_text=text,
-                source_kind=f"plugin:smart_poke:{label}",
-            )
-        except Exception:
-            self.ctx.logger.warning(
-                "[%s] maisaka.context.append 调用异常 (stream=%s)",
-                label, stream_id, exc_info=True,
-            )
-            return
+    async def record_poked_by_to_context(self, ctx: PokeContext) -> None:
+        """开启写入上下文时，把"对方戳了麦麦"先记入上下文，作为麦麦随后回复 / 回戳的前因，
+        避免上下文里只剩麦麦的回复（如"干嘛戳我"）却不知道在回应谁。
 
-        # host 业务失败统一回 {"success": False, "error": ...}；成功则带 index/visible_text/source_kind
-        if isinstance(resp, dict) and resp.get("success") is False:
-            self.ctx.logger.warning(
-                "[%s] maisaka.context.append 业务失败 (stream=%s): %s",
-                label, stream_id, resp.get("error"),
-            )
+        用 QQ 原生戳一戳提示风格（"X戳了戳我"）记一行文本——戳一戳走 adapter API、没有对应
+        的真实消息，只能 append 而非走 send 同步。经 maisaka.context.append(get_or_create)
+        会确保该会话 runtime 存在，从而后续回复的 ctx.send sync 也一定能记入。
+        """
+        if not self.config.plugin.record_self_poke_to_context:
             return
-
-        # 成功时打 info 让用户在日志里能肉眼确认"这次戳已写入麦麦上下文"
-        if isinstance(resp, dict) and resp.get("success") is True:
-            self.ctx.logger.info(
-                "[%s] 已写入 Maisaka 上下文: text=%r, index=%s, stream=%s",
-                label, resp.get("visible_text") or text,
-                resp.get("index"), stream_id,
-            )
-        else:
+        stream_id = await self.resolve_stream_id_for_context(ctx)
+        if not stream_id:
             self.ctx.logger.debug(
-                "[%s] maisaka.context.append 返回了非预期结构: %r", label, resp,
+                "[poked] 无法解析 stream_id，跳过被戳事件注入 (poker=%s)", ctx.poker_id,
             )
+            return
+        poker = (ctx.poker_name or "").strip() or ctx.poker_id or "对方"
+        action = (ctx.poke_action or "").strip() or "戳了戳"
+        text = f"{poker}{action}我"
+        await self._append_self_event_to_context(
+            stream_id=stream_id, text=text, label="poked",
+        )
 
     # ===== Hook 入口 =====
 
@@ -433,10 +528,13 @@ class SmartPokePlugin(MaiBotPlugin):
                 return {"action": "abort"}
             return None
 
-        self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
+        # 接住 mark 返回的时间戳令牌透传给后台反应：当 max_delay_seconds > cooldown_seconds
+        # 时，同一人在思考延迟窗口内再戳会派发新的反应任务，react_to_poke 据此在发送前
+        # 确认自己未被更晚的反应取代，避免叠加回复。
+        react_token = self._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
 
         self._spawn_background_task(
-            self._reaction.react_to_poke(ctx, is_spam, poke_count),
+            self._reaction.react_to_poke(ctx, is_spam, poke_count, react_token),
             "react",
         )
 
@@ -520,10 +618,32 @@ class SmartPokePlugin(MaiBotPlugin):
         ctx.group_id = str(group_int) if group_int is not None else ""
         ctx.is_group = group_int is not None
         ctx.stream_id = str(message.get("session_id") or "")
-        # napcat notice 注入的 session_id 常为空，按 stream_id → group_id → poker_id 回退
-        ctx.cooldown_key = ctx.stream_id or ctx.group_id or ctx.poker_id
+        # 冷却维度用稳定的 group_id（群聊）/ poker_id（私聊），不混入 stream_id：
+        # notice 的 session_id 偶尔缺失会让 cooldown_key 在 stream_id 与 group_id 间漂移、
+        # 逐人冷却分裂成两个 key 而短暂失效。stream_id 只用于发送，不参与冷却 key。
+        ctx.cooldown_key = ctx.group_id or ctx.poker_id
         ctx.spam_scope_key = ctx.group_id if ctx.is_group else ctx.poker_id
+        ctx.poke_action = self._extract_poke_action(payload)
         return ctx
+
+    @staticmethod
+    def _extract_poke_action(payload: dict) -> str:
+        """从 napcat poke notice 的 raw_info 提取自定义戳一戳动作文本（如"拍了拍""捏了捏"）。
+
+        napcat 在 poke notice 的 raw_info 里以
+        ``[{"type":"nor","txt":"拍了拍"}, {"type":"qq", ...}, {"type":"nor","txt":"的脸"}]``
+        形式给出，第一个 ``nor`` 文本即动作词；取不到（旧版 / 无该字段）返回空串，
+        由调用方兜底为"戳了戳"，因此 napcat 不发 raw_info 时也不会回归。
+        """
+        raw_info = payload.get("raw_info")
+        if not isinstance(raw_info, list):
+            return ""
+        for col in raw_info:
+            if isinstance(col, dict) and col.get("type") == "nor":
+                txt = str(col.get("txt") or "").strip()
+                if txt:
+                    return txt
+        return ""
 
 
 def create_plugin() -> SmartPokePlugin:

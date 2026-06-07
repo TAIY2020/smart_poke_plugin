@@ -7,6 +7,7 @@ __pycache__/
 
 # 本地运行配置，可能包含用户/群组名单
 config.toml
+config_back/
 
 # 常见本地杂项
 *.log

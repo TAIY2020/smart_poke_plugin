@@ -23,6 +23,9 @@ MEMBER_NAME_NEGATIVE_CACHE_TTL_SECONDS = 60.0
 
 # notice 消息 session_id 固定为空，stream_id 每次反应都得回查，缓存收益明显。
 STREAM_ID_CACHE_TTL_SECONDS = 1800.0
+# 与 _name_cache 对齐：给 stream_id 缓存一个即时容量上限，避免接触大量群/私聊时
+# 在两次 _prune 之间无界增长（_prune 仅每 _PRUNE_THRESHOLD 次戳才触发一次）。
+STREAM_ID_CACHE_MAX_SIZE = 256
 
 
 # ----- PokeContext -----
@@ -36,6 +39,7 @@ class PokeContext:
         "self_id",
         "poker_id",
         "poker_name",
+        "poke_action",
         "target_id",
         "target_name",
         "group_id",
@@ -49,11 +53,13 @@ class PokeContext:
         self.self_id: str = ""
         self.poker_id: str = ""
         self.poker_name: str = ""
+        # QQ 自定义戳一戳动作文本（如"拍了拍"/"捏了捏"）；取不到则空，使用处兜底"戳了戳"
+        self.poke_action: str = ""
         self.target_id: str = ""
         self.target_name: str = ""
         self.group_id: str = ""
         self.stream_id: str = ""
-        # napcat notice 的 session_id 常为空，按 stream_id → group_id → poker_id 回退
+        # 冷却维度：群聊用 group_id、私聊用 poker_id（稳定，不混 stream_id 以免漂移分裂）
         self.cooldown_key: str = ""
         # 与 cooldown_key 解耦：proactive 分支查 _poked_bot_recently 只能传 group_id，
         # 必须与 record 端用同一个 scope 才能匹配
@@ -72,9 +78,21 @@ class PokeStateManager:
 
     _PRUNE_THRESHOLD = 200
     _STALE_AFTER_SECONDS = 3600
+    # 主动戳观察等"高频但不戳麦麦"的路径按此最小间隔节流触发 _prune，避免该环境下
+    # _prune（原仅靠被动戳计数触发）长期不跑、_proactive_locks/_last_*_at 随群数累积。
+    _PRUNE_MIN_INTERVAL_SECONDS = 300.0
     # 单条暴戳计数 deque 的硬上限——暴戳判定只关心 >= spam_threshold，多余的旧记录
     # 会被天然挤出而不影响判定结果。
     _POKE_RECORD_MAXLEN = 200
+    # 主动戳 in-flight 预占的基础时长下限：覆盖"锁外思考延迟 + 昵称解析 + send_poke RPC"；
+    # 实际 TTL 取 max(本下限, 思考延迟上限 + RPC 余量)，避免 max_delay_seconds 调大后
+    # in-flight 在思考延迟期内提前过期、让其他群穿过全局冷却/每日上限（见 begin_proactive_inflight）。
+    _PROACTIVE_INFLIGHT_TTL_SECONDS = 30.0
+    # send_poke RPC + 安全余量：与思考延迟上限相加，作为动态 in-flight TTL 的候选。
+    _PROACTIVE_INFLIGHT_RPC_MARGIN_SECONDS = 20.0
+    # send_poke 失败后的短全局退避：失败不消耗每日额度/长冷却，但留一小段冷却，
+    # 避免风控期多个群连环重试刷屏。
+    _PROACTIVE_FAILURE_BACKOFF_SECONDS = 15.0
 
     def __init__(self) -> None:
         self._last_react_at: dict[str, float] = {}
@@ -83,6 +101,8 @@ class PokeStateManager:
         )
         self._last_bystander_at: dict[str, float] = {}
         self._record_counter: int = 0
+        # _prune 上次执行时间，供 maybe_prune 做时间节流；被动戳计数触发 _prune 时也会更新它。
+        self._last_prune_at: float = 0.0
         # 反应总数滑动窗口：与逐人冷却互补，防多人轮番车轮战；
         # 跟风戳/主动戳有各自的冷却+日上限，不占用此窗口。
         self._reaction_window: deque[float] = deque()
@@ -91,6 +111,13 @@ class PokeStateManager:
         self._stream_id_cache: dict[str, tuple[str, float]] = {}
         self._last_proactive_at_chat: dict[str, float] = {}
         self._last_proactive_global_at: float = 0.0
+        # 主动戳 in-flight 预占截止时间：begin 设、commit/abort 仅在令牌匹配时清；
+        # in_proactive_global_cooldown 据此把"进行中/失败退避中"也视为全局占用。
+        self._proactive_inflight_until: float = 0.0
+        # in-flight 令牌：每次 begin 自增发牌，commit/abort 校验自己持有的牌是否仍是
+        # 当前牌——避免"旧任务超时后新任务已 begin，旧任务收尾却清掉新任务 in-flight"的误清。
+        self._proactive_inflight_token: int = 0
+        self._proactive_inflight_seq: int = 0
         self._proactive_daily_count: int = 0
         self._proactive_daily_date: str = ""
         # per-group 主动戳锁。放在这里与 _last_proactive_at_chat 同源 prune，
@@ -149,12 +176,36 @@ class PokeStateManager:
         last = self._last_react_at.get(key, 0.0)
         return (time.time() - last) < cooldown_seconds
 
-    def mark_reacted(self, scope_key: str, poker_id: str) -> None:
+    def mark_reacted(self, scope_key: str, poker_id: str) -> float:
+        """标记一次反应，返回写入的时间戳——该时间戳同时充当这次反应的"令牌"。
+
+        反应的真正发送被随机思考延迟推迟，而主链 mark 后立即占冷却。当
+        max_delay_seconds > cooldown_seconds 时，同一人在延迟窗口内再次戳会穿过逐人
+        冷却、再派发一个反应任务。后台任务在延迟后、发送前用本返回值调
+        ``is_reaction_superseded`` 比对，确认自己仍是该 key 最新被授权的反应，否则
+        放弃发送，避免两条回复叠着发出。
+        """
         key = self._cooldown_key(scope_key, poker_id)
         now = time.time()
         if key:
             self._last_react_at[key] = now
         self._reaction_window.append(now)
+        return now
+
+    def is_reaction_superseded(
+        self, scope_key: str, poker_id: str, react_token: float
+    ) -> bool:
+        """该次反应（``react_token`` 为其 ``mark_reacted`` 返回的时间戳）是否已被同一
+        key 上更晚的反应取代。
+
+        返回 ``True`` 表示本任务在延迟期间，同一 cooldown_key 又被 mark 了一次更晚的
+        反应，本任务应放弃发送以免叠加。无 key（无法定位冷却维度）时返回 ``False``
+        放行，与未启用本校验时的旧行为一致。
+        """
+        key = self._cooldown_key(scope_key, poker_id)
+        if not key:
+            return False
+        return self._last_react_at.get(key, 0.0) > react_token
 
     def peek_reaction_window(self, window_seconds: int) -> int:
         """返回窗口内累计反应数，顺便清理过期记录。不写入新记录。"""
@@ -196,6 +247,7 @@ class PokeStateManager:
         self._record_counter += 1
         if self._record_counter >= self._PRUNE_THRESHOLD:
             self._record_counter = 0
+            self._last_prune_at = time.time()
             self._prune()
         return len(records)
 
@@ -265,6 +317,16 @@ class PokeStateManager:
         if not key:
             return
         self._stream_id_cache[key] = (stream_id, time.time() + ttl)
+        if len(self._stream_id_cache) > STREAM_ID_CACHE_MAX_SIZE:
+            now = time.time()
+            # value 是 (stream_id, expire_at)，与 _name_cache 同构：
+            # 先丢已过期项，再按 expire_at 降序保留最晚到期的一半。
+            kept = sorted(
+                ((k, v) for k, v in self._stream_id_cache.items() if v[1] >= now),
+                key=lambda kv: kv[1][1],
+                reverse=True,
+            )[: STREAM_ID_CACHE_MAX_SIZE // 2]
+            self._stream_id_cache = dict(kept)
 
     # ----- 主动戳：冷却与日上限 -----
 
@@ -275,9 +337,14 @@ class PokeStateManager:
         return (time.time() - last) < cooldown_seconds
 
     def in_proactive_global_cooldown(self, cooldown_seconds: int) -> bool:
+        now = time.time()
+        # in-flight 预占期 / 失败退避期一律视为全局占用，挡住其他群并发穿过乐观快检；
+        # 即使 global_cooldown_seconds=0 也要靠它防同一时刻多群并发双发。
+        if now < self._proactive_inflight_until:
+            return True
         if cooldown_seconds <= 0:
             return False
-        return (time.time() - self._last_proactive_global_at) < cooldown_seconds
+        return (now - self._last_proactive_global_at) < cooldown_seconds
 
     def mark_proactive(self, group_id: str, today: str) -> None:
         """``today`` 由调用方按本地日期生成，保持与 active_hour_* 的口径一致。"""
@@ -289,6 +356,53 @@ class PokeStateManager:
             self._proactive_daily_date = today
             self._proactive_daily_count = 0
         self._proactive_daily_count += 1
+
+    def begin_proactive_inflight(self, expected_delay: float = 0.0) -> int:
+        """锁内调用：标记一次主动戳进行中（短期预占），阻止其他群并发穿过全局冷却。
+
+        返回本次 in-flight 的令牌（token），调用方须在 commit/abort 时回传：仅当令牌
+        仍是当前持有者时才真正清理 in-flight，避免旧任务超时、新任务已接管后旧任务
+        收尾误清新任务的占用。
+
+        TTL 取 ``max(基础下限, expected_delay + RPC 余量)``：``expected_delay`` 传思考
+        延迟上限（``cfg.max_delay_seconds``），确保延迟调大后 in-flight 不会在思考延迟
+        期内提前过期、放任其他群穿过全局冷却/每日上限。
+
+        仅占 in-flight，**不**消耗每日额度与群/全局长冷却；待 send_poke 成功后由
+        commit_proactive 转正，或失败/取消时由 abort_proactive_inflight 释放。
+        """
+        self._proactive_inflight_seq += 1
+        token = self._proactive_inflight_seq
+        self._proactive_inflight_token = token
+        ttl = max(
+            self._PROACTIVE_INFLIGHT_TTL_SECONDS,
+            max(0.0, expected_delay) + self._PROACTIVE_INFLIGHT_RPC_MARGIN_SECONDS,
+        )
+        self._proactive_inflight_until = time.time() + ttl
+        return token
+
+    def commit_proactive(self, group_id: str, today: str, token: int) -> None:
+        """send_poke 成功后调用：占用每日额度与群/全局长冷却；仅当 ``token`` 仍是当前
+        持有者时才清 in-flight（否则保留新任务的 in-flight 不动）。
+
+        mark_proactive 无论令牌是否仍当前都执行——戳确实发出去了，理应记一次全局/群
+        冷却与每日额度。
+        """
+        if token == self._proactive_inflight_token:
+            self._proactive_inflight_until = 0.0
+            self._proactive_inflight_token = 0
+        self.mark_proactive(group_id, today)
+
+    def abort_proactive_inflight(self, token: int) -> None:
+        """send_poke 未成功（失败/异常/取消）时调用：不消耗每日额度与长冷却。
+
+        仅当 ``token`` 仍是当前持有者时才把 in-flight 收敛为一小段全局失败退避（避免
+        风控期多个群连环重试刷屏）；若已被更晚的任务接管（令牌过期）则什么都不动，
+        以免误清新任务的 in-flight 占用。
+        """
+        if token == self._proactive_inflight_token:
+            self._proactive_inflight_until = time.time() + self._PROACTIVE_FAILURE_BACKOFF_SECONDS
+            self._proactive_inflight_token = 0
 
     def proactive_daily_count(self, today: str) -> int:
         if today != self._proactive_daily_date:
@@ -311,6 +425,19 @@ class PokeStateManager:
         return any(ts >= cutoff for ts in records)
 
     # ----- prune / clear -----
+
+    def maybe_prune(self) -> None:
+        """按时间节流触发 _prune。
+
+        _prune 原本只在 record_poke_and_count（被动戳）按计数触发；主动戳观察这类
+        "高频但不戳麦麦"的路径调用本方法，确保 _proactive_locks / _last_*_at 等
+        不依赖"有人戳麦麦"也能被定期回收。本方法 O(1)，仅在距上次 _prune 超过
+        _PRUNE_MIN_INTERVAL_SECONDS 时才真正执行一次 O(n) 的 _prune。
+        """
+        now = time.time()
+        if now - self._last_prune_at >= self._PRUNE_MIN_INTERVAL_SECONDS:
+            self._last_prune_at = now
+            self._prune()
 
     def _prune(self) -> None:
         """删除超过 _STALE_AFTER_SECONDS 未更新的 key，控制字典体积。"""
@@ -345,9 +472,13 @@ class PokeStateManager:
         self._stream_id_cache.clear()
         self._last_proactive_at_chat.clear()
         self._last_proactive_global_at = 0.0
+        self._proactive_inflight_until = 0.0
+        self._proactive_inflight_token = 0
+        self._proactive_inflight_seq = 0
         self._proactive_daily_count = 0
         self._proactive_daily_date = ""
         self._reaction_window.clear()
         self._record_counter = 0
+        self._last_prune_at = 0.0
         self._proactive_locks.clear()
         self._known_self_id = ""

@@ -79,24 +79,27 @@ class BystanderPoker:
         if delay > 0:
             await asyncio.sleep(delay)
 
-        if ctx.is_group and ctx.group_id and target_id == ctx.target_id and not ctx.target_name:
+        # 跟风对象是被戳者且消息未带其名片时按需补解析；用局部变量承接，不写回入参 ctx
+        # （ctx 由 _extract_poke_context 每次新建、本不共享，改入参仍是代码味道）。
+        target_name = ctx.target_name
+        if ctx.is_group and ctx.group_id and target_id == ctx.target_id and not target_name:
             resolved = await plugin.resolve_member_name(ctx.group_id, target_id)
             if resolved:
-                ctx.target_name = resolved
+                target_name = resolved
 
         ok = await plugin._napcat.send_poke(
             target_id, ctx.group_id, is_group=ctx.is_group, label="bystander"
         )
         if ok:
-            target_label = ctx.target_name if (target_id == ctx.target_id and ctx.target_name) else target_id
+            target_label = target_name if (target_id == ctx.target_id and target_name) else target_id
             plugin.ctx.logger.info(
                 "[smart_poke] 跟风戳完成: strategy=%s, target=%s (poker=%s, victim=%s)",
                 cfg.target_strategy,
-                target_label, ctx.poker_name or ctx.poker_id, ctx.target_name or ctx.target_id,
+                target_label, ctx.poker_name or ctx.poker_id, target_name or ctx.target_id,
             )
             # target 是 victim 时用已解析的 target_name；是 poker 时用 poker_name；都不命中传空让上层走 resolve
             if target_id == ctx.target_id:
-                injected_name = ctx.target_name
+                injected_name = target_name
             elif target_id == ctx.poker_id:
                 injected_name = ctx.poker_name
             else:

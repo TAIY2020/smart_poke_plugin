@@ -10,14 +10,30 @@ import logging
 from typing import Any, Literal
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 
 _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.6.0"
+CONFIG_SCHEMA_VERSION = "1.7.0"
+
+
+def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
+    """配置告警：``max_delay < min_delay`` 时打一条 warning 提示。
+
+    各模块的延迟抽样都用 ``hi = max(lo, cfg.max_delay_seconds)`` 兜底，误配 max<min
+    不会崩溃，但会静默退化为"固定取 min 值"。这里只补一条提示、刻意不修正字段：
+    ``PluginConfigBase`` 启用了 ``validate_assignment=True``，在 ``model_validator``
+    内赋值会叠加触发额外校验，而运行时兜底已保证安全。
+    """
+    if max_delay < min_delay:
+        _logger.warning(
+            "%s 的 max_delay_seconds(%s) 小于 min_delay_seconds(%s)，"
+            "运行时思考延迟将退化为固定 %ss；建议调整为 max_delay >= min_delay",
+            section, max_delay, min_delay, min_delay,
+        )
 
 
 # --- 配置模型 ---
@@ -46,11 +62,11 @@ class PluginSection(PluginConfigBase):
     record_self_poke_to_context: bool = Field(
         default=False,
         description=(
-            "是否把这次戳行为追加到对应聊天流的 "
+            "是否把麦麦自己的戳一戳互动写入对应聊天流的 Maisaka 上下文"
         ),
         json_schema_extra={
-            "label": "[实验性] 把自己的戳写入上下文",
-            "hint": "默认关闭；若开启会通过硬性「系统事件」前缀 + 第三人称 + 显式禁止复述指令降低风险",
+            "label": "[实验性] 把自己的戳与回复写入上下文",
+            "hint": "默认关闭；开启后回复内容以正常聊天记录形式进上下文，戳动作以 QQ 原生提示风格记录",
         },
     )
 
@@ -68,8 +84,7 @@ class ReactionSection(PluginConfigBase):
         json_schema_extra={
             "label": "反应概率",
             "hint": (
-                "0~1，越大越爱搭理。注意：单类反应（回戳/表情/文字）的期望触发率 ≈ "
-                "react_probability × weight / sum(weights)，再被冷却与每分钟上限进一步削减"
+                "0~1，越大越爱搭理。"
             ),
             "x-widget": "slider",
             "min": 0.0,
@@ -81,10 +96,28 @@ class ReactionSection(PluginConfigBase):
         default=0.6,
         ge=0.0,
         le=1.0,
-        description="反应时选择回戳的权重；三种权重按总和归一化，不要求加起来等于 1",
+        description="反应时选择回戳的权重；各档权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "回戳权重",
-            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
+            "hint": "各档权重按和归一化抽取，不要求加起来等于 1",
+            "x-widget": "slider",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+        },
+    )
+    llm_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "反应时选择『调用 LLM 生成一句拟人回复』的权重，与回戳/表情/文字按总和归一化。"
+            "0 表示关闭该档；该档经 ctx.llm.generate 直接生成、不走主链路，"
+            "并把思考延迟与生成并行以吸收延迟，失败会自动回退到文字回复池"
+        ),
+        json_schema_extra={
+            "label": "LLM 回复权重",
+            "hint": "与回戳/表情/文字按总和归一化抽取；0 关闭。该档不走主链路、自带延迟吸收与回退兜底",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -92,13 +125,13 @@ class ReactionSection(PluginConfigBase):
         },
     )
     emoji_weight: float = Field(
-        default=0.2,
+        default=0.15,
         ge=0.0,
         le=1.0,
-        description="反应时选择发表情包的权重；三种权重按总和归一化，不要求加起来等于 1",
+        description="反应时选择发表情包的权重；各档权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "表情权重",
-            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
+            "hint": "各档权重按和归一化抽取，不要求加起来等于 1",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -109,10 +142,10 @@ class ReactionSection(PluginConfigBase):
         default=0.1,
         ge=0.0,
         le=1.0,
-        description="反应时选择文字回复的权重；三种权重按总和归一化，不要求加起来等于 1",
+        description="反应时选择文字回复的权重；各档权重按总和归一化，不要求加起来等于 1",
         json_schema_extra={
             "label": "文字权重",
-            "hint": "三种权重按和归一化抽取，不要求加起来等于 1",
+            "hint": "各档权重按和归一化抽取，不要求加起来等于 1",
             "x-widget": "slider",
             "min": 0.0,
             "max": 1.0,
@@ -228,6 +261,92 @@ class ReactionSection(PluginConfigBase):
         json_schema_extra={"label": "私聊响应"},
     )
 
+    # ----- LLM 反应档参数（仅当 LLM 回复权重 > 0 时生效）-----
+
+    llm_model: Literal["utils", "replyer", "planner"] = Field(
+        default="planner",
+        description=(
+            "LLM 反应档使用的模型任务槽位（对应 Host model_task_config 下的任务名，"
+            "Host 按 task 名路由到该槽位配置的模型）。"
+            "utils=通用快模型；"
+            "replyer=主回复模型(最贴人设但可能较慢)；planner=规划快模型。"
+            "只能在这几个槽位里选，不要手填具体模型名"
+        ),
+        json_schema_extra={
+            "label": "LLM 模型槽位",
+            "hint": "戳一戳要快可选 utils，要最贴人设可选 replyer",
+            "x-widget": "select",
+            "options": [
+                {"value": "utils", "label": "utils（通用快模型）"},
+                {"value": "replyer", "label": "replyer（主回复模型，最贴人设）"},
+                {"value": "planner", "label": "planner（规划快模型）"},
+            ],
+        },
+    )
+    llm_max_tokens: int = Field(
+        default=256,
+        ge=0,
+        le=512,
+        description=(
+            "LLM 反应档生成的最大 token 数。戳一戳回复通常一两句，设小以加快生成；"
+            "0 表示不覆盖、改用 Host 模型配置"
+        ),
+        json_schema_extra={
+            "label": "LLM 最大 token",
+            "hint": "戳回复一两句即可，默认 256；调小更快，0 表示用 Host 配置",
+        },
+    )
+    llm_temperature: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="LLM 反应档的采样温度，高一点让回复更随机有梗",
+        json_schema_extra={
+            "label": "LLM 温度",
+            "x-widget": "slider",
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+        },
+    )
+    llm_persona: str = Field(
+        default="",
+        description=(
+            "LLM 反应档的人设 / 说话风格描述，作为 system 提示注入。"
+            "留空时自动读取麦麦的全局人设（personality.personality），与主聊天保持一致；"
+            "填写则覆盖，可给戳一戳单独定制更冲 / 更皮的语气。一两句话点明性格即可"
+        ),
+        json_schema_extra={
+            "label": "LLM 人设",
+            "hint": "留空=自动同步麦麦全局人设；填写=给戳一戳单独定制语气",
+            "placeholder": "留空将自动使用麦麦的全局人设",
+            "x-widget": "textarea",
+        },
+    )
+
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _normalize_llm_model(cls, value: Any) -> str:
+        normalized = "" if value is None else str(value).strip()
+        if normalized in ("utils", "replyer", "planner"):
+            return normalized
+        # 空串（含旧配置遗留的 ""）/ 非法值统一回落到默认 planner——必须落在 Literal
+        # 取值集内，否则 pydantic 校验失败会导致插件配置加载崩溃。
+        if normalized:
+            _logger.warning(
+                "reaction.llm_model 配置值 %r 非法，已回落到 'planner'。"
+                "合法取值: utils / replyer / planner",
+                value,
+            )
+        return "planner"
+
+    @model_validator(mode="after")
+    def _check_delay_range(self) -> "ReactionSection":
+        _warn_if_delay_range_inverted(
+            "reaction", self.min_delay_seconds, self.max_delay_seconds
+        )
+        return self
+
 
 class FallbackSection(PluginConfigBase):
     """文字回复随机池。"""
@@ -236,8 +355,8 @@ class FallbackSection(PluginConfigBase):
 
     normal_replies: list[str] = Field(
         default_factory=lambda: [
-            "干嘛戳我",
-            "戳什么戳",
+            "何意味",
+            "你是不是没事干",
             "干啥",
         ],
         description="普通情况下的文字回复随机池",
@@ -245,12 +364,11 @@ class FallbackSection(PluginConfigBase):
     )
     spam_replies: list[str] = Field(
         default_factory=lambda: [
-            "你戳够了没",
-            "好烦别戳了",
-            "你是不是没事干",
+            "够了",
+            "好烦",
             "停！手！",
             "烦不烦",
-            "SB吧",
+            "再戳生气了",
         ],
         description="被暴戳后的文字回复随机池",
         json_schema_extra={"label": "暴戳回复池"},
@@ -392,6 +510,13 @@ class BystanderSection(PluginConfigBase):
         )
         return "victim"
 
+    @model_validator(mode="after")
+    def _check_delay_range(self) -> "BystanderSection":
+        _warn_if_delay_range_inverted(
+            "bystander", self.min_delay_seconds, self.max_delay_seconds
+        )
+        return self
+
 
 class ProactiveSection(PluginConfigBase):
     """主动戳：群里有人说话时，按概率被勾起来戳一下熟人。"""
@@ -463,7 +588,7 @@ class ProactiveSection(PluginConfigBase):
         default=3,
         ge=0,
         le=1000,
-        description="每天主动戳的次数上限（按本地日期归零，0 表示不限制）；超出后当天不再出手",
+        description="每天成功主动戳的次数上限（按本地日期归零，0 表示不限制）；仅统计真正发出去的戳，失败/取消不计入、当天可重试；达到上限后当天不再出手",
         json_schema_extra={"label": "每日上限"},
     )
     lookback_seconds: int = Field(
@@ -586,6 +711,13 @@ class ProactiveSection(PluginConfigBase):
             value,
         )
         return "active_speaker"
+
+    @model_validator(mode="after")
+    def _check_delay_range(self) -> "ProactiveSection":
+        _warn_if_delay_range_inverted(
+            "proactive", self.min_delay_seconds, self.max_delay_seconds
+        )
+        return self
 
 
 class SmartPokeConfig(PluginConfigBase):

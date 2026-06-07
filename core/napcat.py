@@ -2,7 +2,7 @@
 
 封装 ``adapter.napcat.message.send_poke`` 调用：
 
-* NapCat 业务级失败识别（status / retcode 双判定）
+* 识别 Host / Adapter 包装后的 ``send_poke`` 失败信封
 * 失败日志按 label + 时间窗口抑制，避免风控期相同栈刷屏
 
 调用方拿到 ``True`` 即可认为请求已被 NapCat 接受；返回 ``False`` 时已自动打过日志，

@@ -44,6 +44,17 @@ class EmojiKeywordValidator:
         # 但会混入未验证关键词作为表情库新增表情后的刷新机制。
         self._validated_keywords: list[str] = []
         self._miss_counts: dict[str, int] = {}
+        # 表情库就绪标志：启动探测或运行时惰性探测确认 get_emotions 非空后置 True。
+        # 运行时 pick_emoji 据此跳过"表情库为空仍调 get_by_description"，规避主程序
+        # 刷 "[获取表情包] 表情包列表为空" warning（启动探测只在启动期保护，运行时缺位）。
+        self._emoji_ready: bool = False
+
+    def reset(self) -> None:
+        """清空关键词验证缓存，用于配置热更新后重新探测。"""
+        self._validated_keywords.clear()
+        self._miss_counts.clear()
+        # 热更新会重启启动探测，就绪标志一并复位；运行时在新一轮探测置位前会先惰性确认
+        self._emoji_ready = False
 
     # ===== 启动期探测 =====
 
@@ -76,6 +87,7 @@ class EmojiKeywordValidator:
                 result = None
             if isinstance(result, list) and result:
                 emotions = result
+                self._emoji_ready = True
                 if attempt > 1:
                     ctx.logger.debug(
                         "表情库在第 %d 次轮询时就绪（%d 个 emotion 标签）",
@@ -150,6 +162,11 @@ class EmojiKeywordValidator:
         """
         ctx = self._plugin.ctx
         cfg = self._plugin.config.emoji
+        # 表情库未就绪（如启动探测超时后才装表情、或表情库为空）时直接放弃选表情，
+        # 避免对空表情库调 get_by_description 触发主程序 warning；由 react_to_poke 回退回戳/文字。
+        if not await self._ensure_emoji_ready():
+            ctx.logger.debug("[emoji] 表情库尚未就绪，跳过本次选表情")
+            return None
         probe = self._sample_probe_keywords(cfg.description_keywords)
 
         for kw in probe:
@@ -195,6 +212,29 @@ class EmojiKeywordValidator:
         return None
 
     # ===== 内部 =====
+
+    async def _ensure_emoji_ready(self) -> bool:
+        """运行时选表情前确认表情库就绪（命中后置位，不再重复探测）。
+
+        已就绪（启动探测成功，或此前任意一次运行时探测确认过）直接放行；否则用
+        无副作用的 ``emoji.get_emotions`` 惰性探测一次：表情库为空返回 ``False``，
+        让 ``pick_emoji`` 跳过 ``get_by_description``，规避主程序的
+        "[获取表情包] 表情包列表为空" warning。覆盖"启动探测超时后表情库才就绪"
+        与"表情库始终为空"两种场景。
+        """
+        if self._emoji_ready:
+            return True
+        try:
+            emotions = await self._plugin.ctx.emoji.get_emotions()
+        except Exception:
+            self._plugin.ctx.logger.debug(
+                "emoji.get_emotions 运行时就绪探测失败", exc_info=True
+            )
+            return False
+        if isinstance(emotions, list) and emotions:
+            self._emoji_ready = True
+            return True
+        return False
 
     def _sample_probe_keywords(self, keywords: list[str]) -> list[str]:
         """采样关键词：已验证的优先，未验证的作为表情库新增的刷新机制混入。
