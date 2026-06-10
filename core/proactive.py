@@ -52,6 +52,10 @@ class ProactivePoker:
         # 环境下 _prune 长期不跑、_proactive_locks 等随群数累积。
         plugin._state.maybe_prune()
         group_id, speaker_id = info
+        # 聊天范围名单先于 proactive 自身名单：scope 是插件整体的出没范围，
+        # proactive 名单在其上叠加更细的限制。两者都是 O(1) set 查找，照样前移。
+        if not plugin.chat_in_scope(is_group=True, group_id=group_id):
+            return
         # 群级名单只依赖 group_id（O(1) set 查找），前移到派发前：名单外的群直接 return，
         # 不必 spawn 一个进 _maybe_poke 立刻退出的空任务、白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。
         # 黑名单优先；白名单非空时只放行名单内的群。
