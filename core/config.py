@@ -201,8 +201,14 @@ class ReactionSection(PluginConfigBase):
         default=8,
         ge=0,
         le=600,
-        description="同一聊天的反应冷却时间（秒）；冷却期内被戳一律忽略",
-        json_schema_extra={"label": "冷却时长（秒）"},
+        description=(
+            "同一聊天内同一人的反应冷却时间（秒）；冷却期内该用户再戳一律忽略。"
+            "换人戳不受此冷却影响——多人轮番场景由「每分钟反应上限」兜底"
+        ),
+        json_schema_extra={
+            "label": "冷却时长（秒）",
+            "hint": "按「聊天 + 戳的人」逐人冷却；换人不受影响，多人场景看「每分钟反应上限」",
+        },
     )
     max_reactions_per_minute: int = Field(
         default=6,

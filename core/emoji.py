@@ -241,6 +241,10 @@ class EmojiKeywordValidator:
 
         先 ``dict.fromkeys`` 去重：用户在配置中误填重复关键词时，否则同一关键词会
         被多次 RPC 探测，miss 时计数翻倍增长导致该词被过早移出验证集。
+
+        存在未验证关键词时，已验证关键词最多占 ``EMOJI_KEYWORD_PROBE_LIMIT - 1``
+        个槽位——否则已验证数达到上限后未验证关键词永远轮不到运行时探测，
+        "表情库新增表情后的刷新机制"形同虚设。
         """
         cleaned = list(dict.fromkeys(
             str(k).strip() for k in keywords if str(k).strip()
@@ -252,4 +256,6 @@ class EmojiKeywordValidator:
         unvalidated = [k for k in cleaned if k not in validated_set]
         random.shuffle(validated)
         random.shuffle(unvalidated)
+        if unvalidated:
+            validated = validated[: EMOJI_KEYWORD_PROBE_LIMIT - 1]
         return (validated + unvalidated)[:EMOJI_KEYWORD_PROBE_LIMIT]
