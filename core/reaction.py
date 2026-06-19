@@ -454,9 +454,11 @@ class ReactionExecutor:
     def _build_llm_prompt(
         self, ctx: PokeContext, is_spam: bool, persona: str
     ) -> list[dict[str, str]]:
-        """组装精简 messages：system 放人设 + 任务约束，user 放被戳事件。
+        """组装精简 messages：system 放人设(+可选风格) + 任务约束，user 放被戳事件。
 
-        ``persona`` 由 ``_resolve_persona`` 给出（已含全局人设回退）。刻意不拉历史 /
+        ``persona`` 由 ``_resolve_persona`` 给出（已含全局人设回退）。语气默认完全交给
+        人设，仅当用户在 ``reaction.llm_response_style`` 填写时才追加一句风格约束
+        （issue #4：原先硬编码"不失讽刺"等会冲淡 / 带崩用户人设）。刻意不拉历史 /
         记忆以压低首 token 延迟——戳一戳是轻量交互，一句话足矣；需要更连贯的上下文
         时再考虑用 ``ctx.message.get_recent`` 补几条。
         """
@@ -469,8 +471,13 @@ class ReactionExecutor:
             f"现在「{poker}」在 QQ {scene}里{action}你。"
             f"请就「{action}」这个动作回应一句——要贴合「{action}」本身，别把它说成其它动作"
             f"（对方是「{action}」就别回成「戳」之类）。"
-            "回复风格平淡但不失讽刺，很简短,很白话。可以参考贴吧，微博的回复风格；只输出这句话本身，不要加引号 / 解释 / 前缀。"
+            "回复要很简短、很白话；只输出这句话本身，不要加引号 / 解释 / 前缀。"
         )
+        # 风格仅在用户显式配置时追加；留空则不塞任何固定腔调，让语气完全由 persona
+        # 主导（issue #4：硬编码"不失讽刺"会冲淡 / 带崩用户人设）。
+        style = self._plugin.config.reaction.llm_response_style.strip()
+        if style:
+            system += f"\n额外回复风格要求：{style}"
         if is_spam:
             user = f"{poker}连续{action}你好几下，很烦人，回一句。"
         else:

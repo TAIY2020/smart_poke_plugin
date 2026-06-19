@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.1"
+CONFIG_SCHEMA_VERSION = "1.7.2"
 
 
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
@@ -326,6 +326,19 @@ class ReactionSection(PluginConfigBase):
             "label": "LLM 人设",
             "hint": "留空=自动同步麦麦全局人设；填写=给戳一戳单独定制语气",
             "placeholder": "留空将自动使用麦麦的全局人设",
+            "x-widget": "textarea",
+        },
+    )
+    llm_response_style: str = Field(
+        default="",
+        description=(
+            "LLM 戳一戳回复的额外风格要求。留空时不额外指定风格，"
+            "只由麦麦全局人设或上方 LLM 人设决定语气；填写后会追加到提示词约束里"
+        ),
+        json_schema_extra={
+            "label": "LLM 额外回复风格",
+            "hint": "可选；留空则不强行指定讽刺/毒舌等风格，让人设自然发挥",
+            "placeholder": "例如：语气温和一点，像朋友随口吐槽",
             "x-widget": "textarea",
         },
     )
