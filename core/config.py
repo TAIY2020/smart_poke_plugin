@@ -17,7 +17,14 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.5"
+CONFIG_SCHEMA_VERSION = "1.7.6"
+
+
+# proactive.respect_spam_window_seconds 的有效上限：与 state.PokeStateManager._STALE_AFTER_SECONDS
+# （_poke_records 被 _prune 回收的保留窗口，当前 3600s）对齐。超过该值后，更早的「戳过麦麦」
+# 记录会先被 _prune 删除、无法再被 poked_bot_recently 命中，配再大也不会真实生效，故在 schema
+# 层即收口到 3600，避免给出「能回溯一整天」的误导上限。若调整 state 侧阈值，记得同步此处。
+RESPECT_SPAM_WINDOW_MAX_SECONDS = 3600
 
 
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
@@ -215,13 +222,13 @@ class ReactionSection(PluginConfigBase):
         ge=0,
         le=60,
         description=(
-            "过去 60 秒内累计反应（含 silent_reply）次数上限，"
-            "超过即静默吞事件——与逐人冷却不同维度，专治『多人轮番戳麦麦』场景下"
-            "麦麦像永动机一样事事回应的违和感。0 表示完全不限制"
+            "同一会话（群/私聊）过去 60 秒内累计反应（含 silent_reply）次数上限，"
+            "超过即静默吞事件——与逐人冷却不同维度，专治单个群里『多人轮番戳麦麦』场景下"
+            "麦麦像永动机一样事事回应的违和感；按会话独立计数，不同群互不影响。0 表示完全不限制"
         ),
         json_schema_extra={
             "label": "每分钟反应上限",
-            "hint": "0 关闭；逐人冷却拦不住多人轮番车轮战，这里再加一层全局上限",
+            "hint": "0 关闭；逐人冷却拦不住同群多人轮番车轮战，这里再加一层「按会话」的每分钟上限",
         },
     )
     back_poke_max_times: int = Field(
@@ -575,7 +582,7 @@ class ProactiveSection(PluginConfigBase):
         le=1.0,
         description=(
             "群里每收到一条新消息时被勾起主动戳的基础概率。"
-            "活跃群每分钟有十几条消息，0.02 大约对应『几分钟可能出一次手』，"
+            "活跃群每分钟有十几条消息，默认 0.035 大约对应『几分钟可能出一次手』，"
             "再被冷却/日上限/活跃度等约束削减后实际频率会更低"
         ),
         json_schema_extra={
@@ -675,16 +682,17 @@ class ProactiveSection(PluginConfigBase):
     respect_spam_window_seconds: int = Field(
         default=600,
         ge=30,
-        le=86400,
+        le=RESPECT_SPAM_WINDOW_MAX_SECONDS,
         description=(
             "避开『戳过麦麦的人』时使用的回溯窗口（秒）。"
             "与 reaction.spam_window_seconds（默认 45s，用于暴戳态判定）独立——"
             "后者的窗口太短，不足以让对方『刚戳完麦麦立刻被反戳』显得不报复性；"
-            "默认 600 秒（10 分钟）让『避开』更保守一些"
+            "默认 600 秒（10 分钟）让『避开』更保守一些。"
+            "上限 3600s 与内部状态保留窗口对齐：更早的戳记录会被定期清理、配再大也不再生效"
         ),
         json_schema_extra={
             "label": "避开戳过麦麦的窗口（秒）",
-            "hint": "推荐 300~1800；越长越保守，越短越容易反戳",
+            "hint": "推荐 300~1800；越长越保守，越短越容易反戳（上限 3600）",
         },
     )
     target_strategy: Literal["active_speaker", "random_recent"] = Field(

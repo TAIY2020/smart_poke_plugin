@@ -79,6 +79,10 @@ class PokeStateManager:
     """冷却时间戳、暴戳计数、各种 TTL 缓存的集中持有者。"""
 
     _PRUNE_THRESHOLD = 200
+    # 通用 stale 阈值：超过此时长未更新的状态 key 会被 _prune 回收。同时它约束了
+    # config.proactive.respect_spam_window_seconds 的有效上限——_poke_records 中更早的
+    # 「戳过麦麦」记录会被本阈值回收、不再能被 poked_bot_recently 命中，故 config 侧
+    # RESPECT_SPAM_WINDOW_MAX_SECONDS 与此对齐；若调整本值，记得同步 config 侧上限。
     _STALE_AFTER_SECONDS = 3600
     # 主动戳观察等"高频但不戳麦麦"的路径按此最小间隔节流触发 _prune，避免该环境下
     # _prune（原仅靠被动戳计数触发）长期不跑、_proactive_locks/_last_*_at 随群数累积。
@@ -105,9 +109,11 @@ class PokeStateManager:
         self._record_counter: int = 0
         # _prune 上次执行时间，供 maybe_prune 做时间节流；被动戳计数触发 _prune 时也会更新它。
         self._last_prune_at: float = 0.0
-        # 反应总数滑动窗口：与逐人冷却互补，防多人轮番车轮战；
-        # 跟风戳/主动戳有各自的冷却+日上限，不占用此窗口。
-        self._reaction_window: deque[float] = deque()
+        # 反应频率滑动窗口，按会话维度分桶（群聊=group_id、私聊=poker_id，与 cooldown_key
+        # 同口径）：与逐人冷却互补，防同一会话内多人轮番车轮战。分桶而非全局，避免某群被
+        # 刷屏时填满唯一的全局窗口、误伤其他群的正常用户。跟风戳/主动戳有各自的冷却+日上限，
+        # 不占用此窗口。
+        self._reaction_window: dict[str, deque[float]] = defaultdict(deque)
         # name=""为负缓存条目（已知该用户没有可解析昵称），TTL 配更短。
         self._name_cache: dict[str, tuple[str, float]] = {}
         self._stream_id_cache: dict[str, tuple[str, float]] = {}
@@ -191,7 +197,10 @@ class PokeStateManager:
         now = time.time()
         if key:
             self._last_react_at[key] = now
-        self._reaction_window.append(now)
+        # 频率窗口按 scope_key（会话维度）分桶，与 peek_reaction_window 同口径；
+        # 无 scope_key 时不入窗（无法定位会话维度，本就不参与频率限制）。
+        if scope_key:
+            self._reaction_window[scope_key].append(now)
         return now
 
     def is_reaction_superseded(
@@ -209,14 +218,22 @@ class PokeStateManager:
             return False
         return self._last_react_at.get(key, 0.0) > react_token
 
-    def peek_reaction_window(self, window_seconds: int) -> int:
-        """返回窗口内累计反应数，顺便清理过期记录。不写入新记录。"""
-        if window_seconds <= 0:
+    def peek_reaction_window(self, scope_key: str, window_seconds: int) -> int:
+        """返回该会话（``scope_key``）窗口内累计反应数，顺便清理过期记录。不写入新记录。
+
+        ``scope_key`` 须与 :meth:`mark_reacted` 同口径（群聊 group_id / 私聊 poker_id），
+        否则命不中同一个桶。空 ``scope_key`` 或非正窗口视为不限制，返回 0。
+        清空后的空桶留给 ``_prune`` 兜底回收（用 ``.get`` 不凭空创建桶）。
+        """
+        if window_seconds <= 0 or not scope_key:
+            return 0
+        window = self._reaction_window.get(scope_key)
+        if not window:
             return 0
         cutoff = time.time() - window_seconds
-        while self._reaction_window and self._reaction_window[0] < cutoff:
-            self._reaction_window.popleft()
-        return len(self._reaction_window)
+        while window and window[0] < cutoff:
+            window.popleft()
+        return len(window)
 
     # ----- 跟风戳冷却 -----
 
@@ -461,8 +478,14 @@ class PokeStateManager:
             lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN),
             {k: v for k, v in self._poke_records.items() if v and v[-1] >= cutoff},
         )
-        while self._reaction_window and self._reaction_window[0] < cutoff:
-            self._reaction_window.popleft()
+        # 逐桶清理过期反应记录，丢弃清空后的空桶，避免离开的会话长期残留空 deque。
+        pruned_windows: dict[str, deque[float]] = {}
+        for scope_key, window in self._reaction_window.items():
+            while window and window[0] < cutoff:
+                window.popleft()
+            if window:
+                pruned_windows[scope_key] = window
+        self._reaction_window = defaultdict(deque, pruned_windows)
         now = time.time()
         self._name_cache = {k: v for k, v in self._name_cache.items() if v[1] >= now}
         self._stream_id_cache = {k: v for k, v in self._stream_id_cache.items() if v[1] >= now}

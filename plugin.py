@@ -461,6 +461,13 @@ class SmartPokePlugin(MaiBotPlugin):
         if ctx is None:
             return None
 
+        # 戳事件（戳麦麦 / 别人互戳）是会写入冷却、暴戳计数、跟风冷却等状态字典的唯一入口，
+        # 且与 proactive.enabled 无关：在此按时间节流触发一次状态清理（O(1) 检查，实际
+        # _prune 最快每 _PRUNE_MIN_INTERVAL_SECONDS 一次）。兜底覆盖 observe_signal 的
+        # maybe_prune 够不到的路径——主动戳关闭、或纯「别人互戳跟风」场景下，否则 _prune
+        # 只能靠「戳麦麦累计 _PRUNE_THRESHOLD 次」触发，这些状态字典的清理会长期停滞。
+        self._state.maybe_prune()
+
         # ----- 分支一：戳的不是麦麦（别人互戳）-----
         if not ctx.is_poking_bot:
             # send_poke 出去后 napcat 会回灌一条 poker_id=self_id 的事件，提前过滤掉
@@ -508,7 +515,7 @@ class SmartPokePlugin(MaiBotPlugin):
         # 滑动窗口频率限制：逐人冷却拦不住"10 个人轮番戳麦麦"
         max_per_minute = self.config.reaction.max_reactions_per_minute
         if max_per_minute > 0:
-            window_count = self._state.peek_reaction_window(60)
+            window_count = self._state.peek_reaction_window(ctx.cooldown_key, 60)
             if window_count >= max_per_minute:
                 self.ctx.logger.debug(
                     "[%s] 60s 内累计反应 %d 次已达上限 %d，静默吞事件",
@@ -596,13 +603,21 @@ class SmartPokePlugin(MaiBotPlugin):
         self._state.set_known_self_id(self_id)
 
         # 严格判定 group_id：必须正整数才视为群聊，避免 "0" / 0 被误判
-        group_info = msg_info.get("group_info") or {}
+        # group_info / user_info 仅是辅助来源（group_id 回退源、poker 昵称）；异常适配器可能
+        # 把它们填成非 dict 真值（字符串/列表），用 isinstance 降级为空 dict 而非 return None：
+        # 戳事件的关键字段 self_id/poker_id/target_id 已从 payload 取得并校验，不应因辅助字段
+        # 类型异常而丢弃整条合法戳事件（与 _extract_signal 缺 group_info 必须 return None 不同）。
+        group_info = msg_info.get("group_info")
+        if not isinstance(group_info, dict):
+            group_info = {}
         raw_group_id = payload.get("group_id")
         if raw_group_id is None or str(raw_group_id).strip() in ("", "0"):
             raw_group_id = group_info.get("group_id")
         group_int = to_positive_int(raw_group_id)
 
-        user_info = msg_info.get("user_info") or {}
+        user_info = msg_info.get("user_info")
+        if not isinstance(user_info, dict):
+            user_info = {}
 
         # 群名片优先于 nickname，与 resolve_member_name 保持一致
         poker_cardname = str(user_info.get("user_cardname") or "").strip()

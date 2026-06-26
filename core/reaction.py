@@ -58,7 +58,7 @@ class ReactionExecutor:
             # peek / in_cooldown / mark 三者连续同步执行（中间无 await），原子地占用冷却，
             # 避免与正常反应或另一次 silent_reply 撞车双发。
             max_per_minute = plugin.config.reaction.max_reactions_per_minute
-            if max_per_minute > 0 and plugin._state.peek_reaction_window(60) >= max_per_minute:
+            if max_per_minute > 0 and plugin._state.peek_reaction_window(ctx.cooldown_key, 60) >= max_per_minute:
                 plugin.ctx.logger.debug(
                     "[silent_reply] 派发到 mark 之间窗口被填满，静默放弃 (poker=%s)",
                     ctx.poker_id,
@@ -73,11 +73,13 @@ class ReactionExecutor:
                 )
                 return
             react_token = plugin._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
-            await plugin.record_poked_by_to_context(ctx)
             await self._delay_a_bit()
             # 同 react_to_poke：延迟后确认未被同一人更晚的反应取代，避免连戳叠加嘀咕
             if self._superseded(ctx, react_token, "silent_reply"):
                 return
+            # 确认会真正嘀咕一句后才记"对方戳了我"前因，与 react_to_poke 各档口径一致：
+            # 被取代而放弃的任务不写入，避免上下文堆叠多条"X戳了戳我"。
+            await plugin.record_poked_by_to_context(ctx)
             await self._safe_send_text(random.choice(pool), stream_id)
         except Exception:
             plugin.ctx.logger.exception("silent_reply 发送失败")
@@ -110,10 +112,6 @@ class ReactionExecutor:
             if kind in ("emoji", "text", "llm") and not stream_id:
                 kind = "poke"
 
-            # 开启写入上下文时，先记一条"对方戳了我"作为后续回复/回戳的前因，
-            # 避免上下文里只剩麦麦的回复却不知在回应谁（关闭时此调用直接返回）。
-            await plugin.record_poked_by_to_context(ctx)
-
             # llm 档在 _send_llm_reply 内把思考延迟与生成 gather 并行以吸收延迟，
             # 不能再走这里的统一前置延迟；其余档保持"先延迟再发"。
             if kind != "llm":
@@ -123,6 +121,11 @@ class ReactionExecutor:
                 # 故这里只覆盖 poke/emoji/text。
                 if self._superseded(ctx, react_token, "smart_poke"):
                     return
+                # 确认未被连戳取代、即将真正发出反应后，才记一条"对方戳了我"作为前因——
+                # 放在 supersede 之后，避免被取代而放弃的连戳任务也各写一条，导致上下文
+                # 堆叠多条"X戳了戳我"（关闭写入上下文时此调用直接返回）。llm 档的同口径
+                # 记录下沉到 _send_llm_reply 的 supersede 校验之后。
+                await plugin.record_poked_by_to_context(ctx)
 
             plugin.ctx.logger.info(
                 "[smart_poke] 触发反应: kind=%s, is_spam=%s, poke_count=%d, poker=%s, scene=%s",
@@ -159,11 +162,21 @@ class ReactionExecutor:
                 ok = await self._send_llm_reply(ctx, stream_id, is_spam, react_token)
                 if ok:
                     return
+                # LLM 生成软失败（空响应 / 业务 success=False）同样已消耗思考延迟（gather 内的
+                # sleep 已走完），这段延迟里同一人连戳可能已派发更晚的反应任务。与 poke/emoji/text
+                # 档及 _send_llm_reply 成功路径口径一致：回退发送前补一次 supersede 校验，被取代
+                # 则放弃，避免 max_delay_seconds > cooldown_seconds 时旧任务回退与新任务叠加两条。
+                # （RPC 硬异常导致的失败未走完延迟、时间窗口极短，此校验对其也安全无副作用。）
+                if self._superseded(ctx, react_token, "llm"):
+                    return
                 # LLM 失败级联回退：先回复池（延迟已在 _send_llm_reply 内消耗，不再补延迟），
                 # 再不行兜底回戳，避免 mark_reacted 了却什么都没发。
                 plugin.ctx.logger.debug(
                     "[smart_poke] LLM 反应未发出，回退到回复池 (poker=%s)", ctx.poker_id,
                 )
+                # 回退路径即将真正发出一条回复：补记"对方戳了我"前因（_send_llm_reply 仅在
+                # 成功发送前 record，生成失败时未记），同时唤醒 runtime 让回退回复 sync 能记入。
+                await plugin.record_poked_by_to_context(ctx)
                 if await self._send_text(stream_id, is_spam):
                     return
                 plugin.ctx.logger.debug(
@@ -389,35 +402,43 @@ class ReactionExecutor:
         """
         plugin = self._plugin
         cfg = plugin.config.reaction
-        persona = await self._resolve_persona()
-        context_text = await self._fetch_recent_context(stream_id)
-        prompt = self._build_llm_prompt(ctx, is_spam, persona, context_text)
 
         lo = max(0.0, cfg.min_delay_seconds)
         hi = max(lo, cfg.max_delay_seconds)
         delay = random.uniform(lo, hi) if hi > 0 else 0.0
 
-        gen_kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "temperature": cfg.llm_temperature,
-        }
-        model = cfg.llm_model.strip()
-        # llm_model 只会是 utils/replyer/planner（Literal 约束），直接作为任务槽位下发
-        if model:
-            gen_kwargs["model"] = model
-        # max_tokens=0 表示不覆盖、用 Host 模型配置
-        if cfg.llm_max_tokens > 0:
-            gen_kwargs["max_tokens"] = cfg.llm_max_tokens
+        async def _prepare_and_generate() -> Any:
+            # persona 解析与上下文拉取都是「生成前的准备 RPC」，连同 generate 一起放进
+            # 与思考延迟并行的链里：让这几次 RPC 的耗时也被"装作在思考"的延迟吸收。
+            # （原先 persona/context 在 gather 之前串行，是无法被延迟吸收的纯增延迟；
+            # 二者内部均已 try/except 降级，不会把异常抛进本链，故链里抛出的基本只有
+            # generate 的 RPC 硬异常。）
+            persona = await self._resolve_persona()
+            context_text = await self._fetch_recent_context(stream_id)
+            prompt = self._build_llm_prompt(ctx, is_spam, persona, context_text)
+            gen_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+                "temperature": cfg.llm_temperature,
+            }
+            model = cfg.llm_model.strip()
+            # llm_model 只会是 utils/replyer/planner（Literal 约束），直接作为任务槽位下发
+            if model:
+                gen_kwargs["model"] = model
+            # max_tokens=0 表示不覆盖、用 Host 模型配置
+            if cfg.llm_max_tokens > 0:
+                gen_kwargs["max_tokens"] = cfg.llm_max_tokens
+            return await plugin.ctx.llm.generate(**gen_kwargs)
 
         try:
+            # 思考延迟与「准备+生成」整条链并行：净增延迟 ≈ max(0, 链耗时 − 思考延迟)。
             # generate 软失败返回 dict(success=False) 时 sleep 仍会正常走完延迟；
             # 仅 RPC 层硬异常会让 gather 提前抛出，此时直接回退（罕见路径不补延迟）。
             _, result = await asyncio.gather(
                 asyncio.sleep(delay),
-                plugin.ctx.llm.generate(**gen_kwargs),
+                _prepare_and_generate(),
             )
         except Exception:
-            plugin.ctx.logger.debug("[llm] generate 调用异常，回退到回复池", exc_info=True)
+            plugin.ctx.logger.debug("[llm] 生成链调用异常，回退到回复池", exc_info=True)
             return False
 
         text = self._extract_llm_text(result)
@@ -430,6 +451,11 @@ class ReactionExecutor:
         # 回退再补发一条回复池/回戳。
         if self._superseded(ctx, react_token, "llm"):
             return True
+
+        # 确认未被取代、即将真正发出 llm 回复后才记"对方戳了我"前因，与非 llm 档口径一致：
+        # 被连戳取代而放弃的任务不写入。生成失败（上方 return False）的回退发送由
+        # react_to_poke 的 llm 回退分支补记，避免此处漏记前因 / 漏唤醒 runtime。
+        await plugin.record_poked_by_to_context(ctx)
 
         ok = await self._safe_send_text(text, stream_id)
         if ok:
