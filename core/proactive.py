@@ -19,7 +19,7 @@ import random
 import time
 from typing import TYPE_CHECKING, Any
 
-from .common import format_local_date, in_active_hours, to_positive_int
+from .common import in_active_hours, to_positive_int
 
 
 if TYPE_CHECKING:
@@ -52,10 +52,6 @@ class ProactivePoker:
         # 环境下 _prune 长期不跑、_proactive_locks 等随群数累积。
         plugin._state.maybe_prune()
         group_id, speaker_id = info
-        # 聊天范围名单先于 proactive 自身名单：scope 是插件整体的出没范围，
-        # proactive 名单在其上叠加更细的限制。两者都是 O(1) set 查找，照样前移。
-        if not plugin.chat_in_scope(is_group=True, group_id=group_id):
-            return
         # 群级名单只依赖 group_id（O(1) set 查找），前移到派发前：名单外的群直接 return，
         # 不必 spawn 一个进 _maybe_poke 立刻退出的空任务、白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。
         # 黑名单优先；白名单非空时只放行名单内的群。
@@ -147,9 +143,8 @@ class ProactivePoker:
                 return
             if plugin._state.in_proactive_chat_cooldown(group_id, cfg.per_chat_cooldown_seconds):
                 return
-            today = format_local_date(time.time())
             if cfg.max_pokes_per_day > 0:
-                already = plugin._state.proactive_daily_count(today)
+                already = plugin._state.proactive_daily_count()
                 if already >= cfg.max_pokes_per_day:
                     return
 
@@ -195,7 +190,7 @@ class ProactivePoker:
                 if plugin._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
                     return
                 if cfg.max_pokes_per_day > 0:
-                    already = plugin._state.proactive_daily_count(today)
+                    already = plugin._state.proactive_daily_count()
                     if already >= cfg.max_pokes_per_day:
                         return
                 # 锁内只预占 in-flight 防并发双发；每日额度与群/全局长冷却推迟到
@@ -223,7 +218,7 @@ class ProactivePoker:
             )
             if ok:
                 # 发送成功，正式占用每日额度与群/全局长冷却（令牌匹配时顺带清 in-flight）
-                plugin._state.commit_proactive(group_id, today, inflight_token)
+                plugin._state.commit_proactive(group_id, inflight_token)
                 committed = True
                 plugin.ctx.logger.info(
                     "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",

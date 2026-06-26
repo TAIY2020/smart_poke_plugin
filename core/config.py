@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.2"
+CONFIG_SCHEMA_VERSION = "1.7.3"
 
 
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
@@ -420,63 +420,6 @@ class UserControlSection(PluginConfigBase):
     )
 
 
-class ScopeSection(PluginConfigBase):
-    """聊天范围名单：插件在哪些群聊/私聊里允许出没。
-
-    适配器的聊天名单过滤在修复合入前的版本里不覆盖 notice 事件，名单外
-    群聊/私聊的戳一戳通知仍会进 Host，这里提供插件侧的兜底名单。
-    空名单 = 不限制，黑名单优先；作用于被戳反应、跟风戳与主动戳
-    （主动戳自己的群名单在此基础上叠加生效）。
-    """
-
-    __ui_label__ = "聊天范围"
-
-    whitelist_groups: list[str] = Field(
-        default_factory=list,
-        description=(
-            "群白名单：只在这些群里响应戳一戳（被戳反应/跟风戳/主动戳）；"
-            "为空表示『没有白名单限制』。与群黑名单同时存在时，黑名单优先生效"
-        ),
-        json_schema_extra={
-            "label": "群白名单",
-            "hint": "旧版适配器的聊天名单不拦截戳一戳通知，可在这里兜底；留空不限制",
-        },
-    )
-    blacklist_groups: list[str] = Field(
-        default_factory=list,
-        description="群黑名单：永不在这些群里响应任何戳一戳行为",
-        json_schema_extra={"label": "群黑名单"},
-    )
-    whitelist_private: list[str] = Field(
-        default_factory=list,
-        description=(
-            "私聊白名单（对方 QQ 号）：只响应这些人的私聊戳一戳；"
-            "为空表示『没有白名单限制』。与私聊黑名单同时存在时，黑名单优先生效"
-        ),
-        json_schema_extra={
-            "label": "私聊白名单",
-            "hint": "留空不限制；填写后仅响应名单内的私聊戳一戳",
-        },
-    )
-    blacklist_private: list[str] = Field(
-        default_factory=list,
-        description="私聊黑名单（对方 QQ 号）：永不响应这些人的私聊戳一戳",
-        json_schema_extra={"label": "私聊黑名单"},
-    )
-    swallow_out_of_scope: bool = Field(
-        default=True,
-        description=(
-            "名单外聊天的戳一戳事件是否直接吞掉（abort）。"
-            "默认 True：连主程序自带的戳一戳回应一起压掉，让 bot 在名单外彻底沉默；"
-            "改为 False 则仅本插件不响应，事件继续传给主程序"
-        ),
-        json_schema_extra={
-            "label": "名单外吞事件",
-            "hint": "True 时名单外聊天里 bot 对戳一戳彻底沉默；False 只是本插件不出手",
-        },
-    )
-
-
 class EmojiSection(PluginConfigBase):
     """表情包反应配置。"""
 
@@ -803,7 +746,6 @@ class SmartPokeConfig(PluginConfigBase):
     reaction: ReactionSection = Field(default_factory=ReactionSection)
     fallback: FallbackSection = Field(default_factory=FallbackSection)
     user_control: UserControlSection = Field(default_factory=UserControlSection)
-    scope: ScopeSection = Field(default_factory=ScopeSection)
     emoji: EmojiSection = Field(default_factory=EmojiSection)
     bystander: BystanderSection = Field(default_factory=BystanderSection)
     proactive: ProactiveSection = Field(default_factory=ProactiveSection)

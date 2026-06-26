@@ -53,10 +53,6 @@ class SmartPokePlugin(MaiBotPlugin):
         self._blacklist: set[str] = set()
         self._proactive_whitelist_groups: set[str] = set()
         self._proactive_blacklist_groups: set[str] = set()
-        self._scope_whitelist_groups: set[str] = set()
-        self._scope_blacklist_groups: set[str] = set()
-        self._scope_whitelist_private: set[str] = set()
-        self._scope_blacklist_private: set[str] = set()
         self._pending_tasks: set[asyncio.Task] = set()
         # emoji 关键词探测任务句柄：热更新时取消上一轮未结束的探测，避免累积并发长轮询。
         self._emoji_probe_task: asyncio.Task | None = None
@@ -115,37 +111,6 @@ class SmartPokePlugin(MaiBotPlugin):
         self._proactive_blacklist_groups = {
             str(x).strip() for x in cfg.proactive.blacklist_groups if str(x).strip()
         }
-        self._scope_whitelist_groups = {
-            str(x).strip() for x in cfg.scope.whitelist_groups if str(x).strip()
-        }
-        self._scope_blacklist_groups = {
-            str(x).strip() for x in cfg.scope.blacklist_groups if str(x).strip()
-        }
-        self._scope_whitelist_private = {
-            str(x).strip() for x in cfg.scope.whitelist_private if str(x).strip()
-        }
-        self._scope_blacklist_private = {
-            str(x).strip() for x in cfg.scope.blacklist_private if str(x).strip()
-        }
-
-    def chat_in_scope(self, *, is_group: bool, group_id: str = "", peer_id: str = "") -> bool:
-        """判断一个聊天是否落在「聊天范围」名单内（黑名单优先，空白名单不限制）。
-
-        插件侧兜底：适配器的聊天名单过滤在修复合入前的版本里不覆盖 notice 事件，
-        名单外群聊/私聊的戳一戳通知仍会进 Host。被戳反应与跟风戳在 hook 入口检查；
-        主动戳在 ``ProactivePoker.observe_signal`` 派发前检查（仅群维度）。
-        """
-        if is_group:
-            if group_id in self._scope_blacklist_groups:
-                return False
-            if self._scope_whitelist_groups and group_id not in self._scope_whitelist_groups:
-                return False
-            return True
-        if peer_id in self._scope_blacklist_private:
-            return False
-        if self._scope_whitelist_private and peer_id not in self._scope_whitelist_private:
-            return False
-        return True
 
     # ===== 后台任务调度 =====
 
@@ -240,7 +205,7 @@ class SmartPokePlugin(MaiBotPlugin):
                     no_cache=False,
                 )
                 if isinstance(info, dict):
-                    name = str(info.get("nickname") or info.get("nick") or "").strip()
+                    name = str(info.get("nickname") or "").strip()
         except Exception:
             self.ctx.logger.debug(
                 "解析昵称失败 (group=%s, user=%s)", group_id, user_id, exc_info=True
@@ -494,21 +459,6 @@ class SmartPokePlugin(MaiBotPlugin):
 
         ctx = self._extract_poke_context(message)
         if ctx is None:
-            return None
-
-        # ----- 聊天范围名单（插件侧兜底）-----
-        # 私聊的"对端"通常是发起戳的人；bot 自己戳人产生的回声事件里 poker 是
-        # bot 自身，此时对端取 target_id，保证回声也按同一聊天归类。
-        peer_id = ctx.poker_id if ctx.poker_id != ctx.self_id else ctx.target_id
-        if not self.chat_in_scope(
-            is_group=ctx.is_group, group_id=ctx.group_id, peer_id=peer_id
-        ):
-            self.ctx.logger.debug(
-                "[scope] 聊天不在范围名单内，忽略戳一戳事件 (group=%s, peer=%s)",
-                ctx.group_id, peer_id,
-            )
-            if self.config.scope.swallow_out_of_scope:
-                return {"action": "abort"}
             return None
 
         # ----- 分支一：戳的不是麦麦（别人互戳）-----

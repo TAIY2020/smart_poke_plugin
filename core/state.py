@@ -14,6 +14,8 @@ import asyncio
 import time
 from collections import defaultdict, deque
 
+from .common import format_local_date
+
 
 # ----- 状态层相关常量 -----
 
@@ -346,9 +348,16 @@ class PokeStateManager:
             return False
         return (now - self._last_proactive_global_at) < cooldown_seconds
 
-    def mark_proactive(self, group_id: str, today: str) -> None:
-        """``today`` 由调用方按本地日期生成，保持与 active_hour_* 的口径一致。"""
+    def mark_proactive(self, group_id: str) -> None:
+        """按当前本地日期归零并累计每日计数。
+
+        日期在内部按 ``time.time()`` 当场计算（而非由调用方传入）：主动戳是
+        "锁内算日期、思考延迟后锁外才 commit"，若沿用锁内日期，跨午夜会把
+        ``_proactive_daily_date`` 拨回前一天、令当日计数被错误重置。
+        ``format_local_date`` 与 active_hour_* 同口径（本地时间）。
+        """
         now = time.time()
+        today = format_local_date(now)
         if group_id:
             self._last_proactive_at_chat[group_id] = now
         self._last_proactive_global_at = now
@@ -381,17 +390,17 @@ class PokeStateManager:
         self._proactive_inflight_until = time.time() + ttl
         return token
 
-    def commit_proactive(self, group_id: str, today: str, token: int) -> None:
+    def commit_proactive(self, group_id: str, token: int) -> None:
         """send_poke 成功后调用：占用每日额度与群/全局长冷却；仅当 ``token`` 仍是当前
         持有者时才清 in-flight（否则保留新任务的 in-flight 不动）。
 
         mark_proactive 无论令牌是否仍当前都执行——戳确实发出去了，理应记一次全局/群
-        冷却与每日额度。
+        冷却与每日额度（其日期在 mark_proactive 内按当前时刻计算，不受锁内外时差影响）。
         """
         if token == self._proactive_inflight_token:
             self._proactive_inflight_until = 0.0
             self._proactive_inflight_token = 0
-        self.mark_proactive(group_id, today)
+        self.mark_proactive(group_id)
 
     def abort_proactive_inflight(self, token: int) -> None:
         """send_poke 未成功（失败/异常/取消）时调用：不消耗每日额度与长冷却。
@@ -404,8 +413,9 @@ class PokeStateManager:
             self._proactive_inflight_until = time.time() + self._PROACTIVE_FAILURE_BACKOFF_SECONDS
             self._proactive_inflight_token = 0
 
-    def proactive_daily_count(self, today: str) -> int:
-        if today != self._proactive_daily_date:
+    def proactive_daily_count(self) -> int:
+        """返回当日已成功主动戳次数；按当前本地日期判定，跨午夜自动归零。"""
+        if format_local_date(time.time()) != self._proactive_daily_date:
             return 0
         return self._proactive_daily_count
 
