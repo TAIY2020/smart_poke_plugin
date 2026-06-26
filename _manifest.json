@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.8.1",
+  "version": "1.8.3",
   "name": "智能戳一戳插件 | Smart Poke Plugin",
   "description": "一个让麦麦在 QQ 戳一戳里尽量像真人一样反应的拟人化交互插件。",
   "author": {
@@ -34,6 +34,7 @@
     "chat.get_stream_by_user_id",
     "chat.open_session",
     "message.get_recent",
+    "message.build_readable",
     "maisaka.context.append",
     "llm.generate",
     "config.get"

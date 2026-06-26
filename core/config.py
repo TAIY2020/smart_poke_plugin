@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.4"
+CONFIG_SCHEMA_VERSION = "1.7.5"
 
 
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
@@ -340,6 +340,22 @@ class ReactionSection(PluginConfigBase):
             "hint": "可选；留空则不强行指定讽刺/毒舌等风格，让人设自然发挥",
             "placeholder": "例如：语气温和一点，像朋友随口吐槽",
             "x-widget": "textarea",
+        },
+    )
+    llm_context_messages: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description=(
+            "LLM 反应档生成回复前，额外拉取最近多少条聊天记录作为氛围上下文注入提示词。"
+            "0 表示不拉取（默认，最快，戳一戳作为独立轻量交互）；"
+            ">0 时先 message.get_recent 拉取、build_readable 格式化后注入 system，"
+            "让被戳回复能接住群里 / 对话正在聊的话题，代价是生成前多一次拉取延迟。"
+            "仅在 LLM 回复权重 > 0 时生效；建议 5~10"
+        ),
+        json_schema_extra={
+            "label": "LLM 上下文消息数",
+            "hint": "0=不拉历史(最快、默认)；填几条让戳回复更连贯，会略增延迟，建议 5~10",
         },
     )
 

@@ -134,7 +134,7 @@ class ReactionExecutor:
             )
 
             if kind == "poke":
-                ok = await self._send_back_poke(ctx, is_spam=is_spam)
+                ok = await self._send_back_poke(ctx, is_spam=is_spam, stream_id=stream_id)
                 if not ok:
                     if stream_id:
                         await self._send_text(stream_id, is_spam)
@@ -150,7 +150,7 @@ class ReactionExecutor:
                 if ok:
                     return
                 plugin.ctx.logger.debug("表情反应失败，回退到回戳")
-                ok_poke = await self._send_back_poke(ctx, is_spam=is_spam)
+                ok_poke = await self._send_back_poke(ctx, is_spam=is_spam, stream_id=stream_id)
                 if not ok_poke:
                     await self._send_text(stream_id, is_spam)
                 return
@@ -169,7 +169,7 @@ class ReactionExecutor:
                 plugin.ctx.logger.debug(
                     "[smart_poke] LLM 与回复池均未发出，回退到回戳 (poker=%s)", ctx.poker_id,
                 )
-                await self._send_back_poke(ctx, is_spam=is_spam)
+                await self._send_back_poke(ctx, is_spam=is_spam, stream_id=stream_id)
                 return
 
             sent = await self._send_text(stream_id, is_spam)
@@ -179,7 +179,7 @@ class ReactionExecutor:
             plugin.ctx.logger.debug(
                 "[smart_poke] 文字反应未发出，回退到回戳 (poker=%s)", ctx.poker_id,
             )
-            await self._send_back_poke(ctx, is_spam=is_spam)
+            await self._send_back_poke(ctx, is_spam=is_spam, stream_id=stream_id)
         except Exception:
             plugin.ctx.logger.exception("反应戳一戳时出错")
 
@@ -248,7 +248,9 @@ class ReactionExecutor:
 
     # ===== 内部：发送实现 =====
 
-    async def _send_back_poke(self, ctx: PokeContext, is_spam: bool = False) -> bool:
+    async def _send_back_poke(
+        self, ctx: PokeContext, is_spam: bool = False, stream_id: str = ""
+    ) -> bool:
         """通过 NapCat 适配器发送回戳，支持多次连续戳。
 
         防自戳死循环：ignore_self_poke=False 时若让麦麦回戳自己，新的 send_poke
@@ -292,7 +294,10 @@ class ReactionExecutor:
                 target_name=ctx.poker_name,
                 group_id=ctx.group_id,
                 is_group=ctx.is_group,
-                stream_id=ctx.stream_id,
+                # 复用 react_to_poke 已解析（含冷群 open_session）的 stream_id，
+                # 避免 record 内部按 ctx.stream_id（notify 路径常为空）再回查一次；
+                # 解析失败时退回 ctx.stream_id，与原行为一致。
+                stream_id=stream_id or ctx.stream_id,
             )
         return any_success
 
@@ -385,7 +390,8 @@ class ReactionExecutor:
         plugin = self._plugin
         cfg = plugin.config.reaction
         persona = await self._resolve_persona()
-        prompt = self._build_llm_prompt(ctx, is_spam, persona)
+        context_text = await self._fetch_recent_context(stream_id)
+        prompt = self._build_llm_prompt(ctx, is_spam, persona, context_text)
 
         lo = max(0.0, cfg.min_delay_seconds)
         hi = max(lo, cfg.max_delay_seconds)
@@ -430,6 +436,37 @@ class ReactionExecutor:
             plugin.ctx.logger.info("[llm] 已发送生成回复: %r (is_spam=%s)", text, is_spam)
         return ok
 
+    async def _fetch_recent_context(self, stream_id: str) -> str:
+        """按 ``reaction.llm_context_messages`` 拉取最近聊天记录并格式化为可读文本。
+
+        默认 0：不拉历史，返回空串（戳一戳作为独立轻量交互，压低首 token 延迟，
+        与原行为一致）。>0 时用 ``message.get_recent`` + ``message.build_readable``
+        拉取最近若干条并格式化，让被戳回复能接住群里 / 对话正在聊的话题。
+
+        这两次 RPC 在 ``_send_llm_reply`` 的思考延迟 / 生成 gather **之前**串行，
+        故仅在用户主动开启（>0）时才付出这点拉取延迟；任一步失败一律降级为空串，
+        绝不影响主回复生成。
+        """
+        cfg = self._plugin.config.reaction
+        limit = cfg.llm_context_messages
+        if limit <= 0 or not stream_id:
+            return ""
+        ctx = self._plugin.ctx
+        try:
+            recent = await ctx.message.get_recent(stream_id, limit=limit)
+        except Exception:
+            ctx.logger.debug("[llm] 拉取上下文消息失败 (stream=%s)", stream_id, exc_info=True)
+            return ""
+        if not isinstance(recent, list) or not recent:
+            return ""
+        try:
+            # build_readable 输出带说话人名 / 相对时间的标准聊天记录串，并自动替换 bot 名。
+            readable = await ctx.message.build_readable(recent, timestamp_mode="relative")
+        except Exception:
+            ctx.logger.debug("[llm] 格式化上下文消息失败 (stream=%s)", stream_id, exc_info=True)
+            return ""
+        return readable.strip() if isinstance(readable, str) else ""
+
     async def _resolve_persona(self) -> str:
         """解析 LLM 人设：插件显式配置 > 麦麦全局人设 > 兜底。
 
@@ -452,15 +489,18 @@ class ReactionExecutor:
         return _DEFAULT_LLM_PERSONA
 
     def _build_llm_prompt(
-        self, ctx: PokeContext, is_spam: bool, persona: str
+        self, ctx: PokeContext, is_spam: bool, persona: str, context_text: str = ""
     ) -> list[dict[str, str]]:
-        """组装精简 messages：system 放人设(+可选风格) + 任务约束，user 放被戳事件。
+        """组装精简 messages：system 放人设(+可选风格+可选聊天记录) + 任务约束，user 放被戳事件。
 
         ``persona`` 由 ``_resolve_persona`` 给出（已含全局人设回退）。语气默认完全交给
         人设，仅当用户在 ``reaction.llm_response_style`` 填写时才追加一句风格约束
-        （issue #4：原先硬编码"不失讽刺"等会冲淡 / 带崩用户人设）。刻意不拉历史 /
-        记忆以压低首 token 延迟——戳一戳是轻量交互，一句话足矣；需要更连贯的上下文
-        时再考虑用 ``ctx.message.get_recent`` 补几条。
+        （issue #4：原先硬编码"不失讽刺"等会冲淡 / 带崩用户人设）。
+
+        ``context_text`` 为 ``_fetch_recent_context`` 按 ``reaction.llm_context_messages``
+        拉取的最近聊天记录：默认空（不拉历史、压低首 token 延迟，戳一戳是轻量交互）；
+        非空时作为氛围背景注入 system，并明确标注"仅供了解氛围、勿直接回复其内容"，
+        避免 LLM 把"回应被戳"跑偏成"回应聊天记录"。
         """
         scene = "群聊" if ctx.is_group else "私聊"
         poker = (ctx.poker_name or "").strip() or "有人"
@@ -478,6 +518,13 @@ class ReactionExecutor:
         style = self._plugin.config.reaction.llm_response_style.strip()
         if style:
             system += f"\n额外回复风格要求：{style}"
+        # 可选注入最近聊天记录作为氛围参考（reaction.llm_context_messages > 0 时）：
+        # 明确标注只是背景、主回应对象仍是「被戳」这件事，避免 LLM 跑偏去答聊天内容。
+        if context_text:
+            system += (
+                "\n\n这是最近的聊天记录，仅供你了解当前氛围，不要直接回复其中的内容：\n"
+                f"{context_text}"
+            )
         if is_spam:
             user = f"{poker}连续{action}你好几下，很烦人，回一句。"
         else:
