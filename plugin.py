@@ -25,7 +25,7 @@ from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .core.bystander import BystanderPoker
-from .core.common import PLUGIN_VERSION, PROACTIVE_TASK_QUEUE_LIMIT, to_positive_int
+from .core.common import PLUGIN_VERSION, PROACTIVE_TASK_QUEUE_LIMIT, extract_onebot_field, to_positive_int
 from .core.config import SmartPokeConfig
 from .core.emoji import EmojiKeywordValidator
 from .core.napcat import NapcatPokeClient
@@ -190,11 +190,10 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                # SDK _normalize_capability_result 已对 api.call 解出 envelope.result，
-                # info 直接是 adapter 返回的 dict；失败时是 {"success": False, ...}，
-                # .get("card") / .get("nickname") 都为 None，统一落到 name="" 走负缓存。
-                if isinstance(info, dict):
-                    name = str(info.get("card") or info.get("nickname") or "").strip()
+                # info 为 adapter 返回的 dict；失败时是 {"success": False, ...}，各字段
+                # 取不到统一落到 name="" 走负缓存。extract_onebot_field 兼容 NapCat
+                # (data 已剥到顶层)与 SnowLuma 等(card/nickname 裹在 data 里)两类返回。
+                name = extract_onebot_field(info, "card", "nickname")
             else:
                 user_int = to_positive_int(user_id)
                 if user_int is None:
@@ -204,8 +203,9 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                if isinstance(info, dict):
-                    name = str(info.get("nickname") or "").strip()
+                # get_stranger_info 仅有 nickname 字段；extract_onebot_field 兼容
+                # data 已剥离(NapCat)与未剥离(SnowLuma)两种返回结构。
+                name = extract_onebot_field(info, "nickname")
         except Exception:
             self.ctx.logger.debug(
                 "解析昵称失败 (group=%s, user=%s)", group_id, user_id, exc_info=True

@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.3"
+CONFIG_SCHEMA_VERSION = "1.7.4"
 
 
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
