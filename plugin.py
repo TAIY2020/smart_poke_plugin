@@ -18,7 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import random
+import uuid
+from pathlib import Path
 from typing import Any
 
 from maibot_sdk import HookHandler, MaiBotPlugin
@@ -77,6 +81,8 @@ class SmartPokePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._shutting_down = False
         self._refresh_user_sets()
+        # 恢复上次卸载时落盘的限频状态（冷却/每日上限），过期项由 import 侧丢弃。
+        await asyncio.to_thread(self._load_state_snapshot_sync)
         self.ctx.logger.info("智能戳一戳插件(v%s)初始化完成。", PLUGIN_VERSION)
         self._spawn_emoji_probe()
 
@@ -91,7 +97,54 @@ class SmartPokePlugin(MaiBotPlugin):
         self._pending_tasks.clear()
         self._emoji_probe_task = None
         self._proactive_active_count = 0
+        # clear() 之前落盘限频快照：重启/重载后冷却与每日上限得以延续，
+        # 防止"重启即清零 → 立即连戳 / 主动戳额度刷新"。
+        await asyncio.to_thread(self._save_state_snapshot_sync)
         self._state.clear()  # 同时清掉 _state 内的 _proactive_locks
+
+    # ===== 限频状态持久化 =====
+
+    def _state_snapshot_path(self) -> Path | None:
+        """限频快照文件路径（ctx.paths.data_dir 下）；目录不可用时返回 None 静默降级。"""
+        try:
+            data_dir = Path(self.ctx.paths.data_dir)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            return data_dir / "rate_limit_state.json"
+        except Exception as e:
+            self.ctx.logger.warning("获取插件持久数据目录失败: %s；限频状态本次不持久化", e)
+            return None
+
+    def _load_state_snapshot_sync(self) -> None:
+        """读盘恢复限频快照（同步，经 to_thread 调用）；文件缺失/损坏按无快照处理。"""
+        path = self._state_snapshot_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            self.ctx.logger.warning("读取限频快照失败: %s；按无快照启动", e)
+            return
+        self._state.import_persistable(data)
+        self.ctx.logger.info("已恢复限频状态快照（冷却/每日上限）")
+
+    def _save_state_snapshot_sync(self) -> None:
+        """把限频状态原子写盘（同步，经 to_thread 调用）；失败仅记日志不影响卸载。"""
+        path = self._state_snapshot_path()
+        if path is None:
+            return
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._state.export_persistable(), f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(path)
+        except OSError as e:
+            self.ctx.logger.warning("写入限频快照失败: %s", e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def on_config_update(
         self, scope: str, config_data: dict, version: str

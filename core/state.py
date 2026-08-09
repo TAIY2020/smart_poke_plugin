@@ -4,7 +4,9 @@
     * ``PokeContext`` —— 从一次戳事件解析出的关键字段。
     * ``PokeStateManager`` —— 冷却、暴戳计数、各种 TTL 缓存、主动戳每日上限/锁的集中持有者。
 
-仅持有内存态，热重载会丢失（接受）。所有方法都是同步的；与事件循环交互的部分由
+运行时仅持有内存态；冷却/每日上限等限频字段经 export_persistable /
+import_persistable 由插件层在卸载/加载时落盘与恢复，其余缓存热重载丢失（接受）。
+所有方法都是同步的；与事件循环交互的部分由
 ``ProactivePoker`` / ``ReactionExecutor`` 等模块自行处理。
 """
 
@@ -450,6 +452,67 @@ class PokeStateManager:
             return False
         cutoff = time.time() - window_seconds
         return any(ts >= cutoff for ts in records)
+
+    # ----- 持久化快照 -----
+
+    def export_persistable(self) -> dict:
+        """导出值得跨重启保留的限频状态（卸载时由插件写盘）。
+
+        只挑"丢了会造成实际影响"的字段：冷却时间戳防重启后立即连戳、
+        每日计数防重启刷新主动戳额度。TTL 缓存 / 暴戳窗口 / in-flight 等
+        短命或运行时态不导出，加载后自然重建。
+        """
+        return {
+            "last_react_at": dict(self._last_react_at),
+            "last_bystander_at": dict(self._last_bystander_at),
+            "last_proactive_at_chat": dict(self._last_proactive_at_chat),
+            "last_proactive_global_at": self._last_proactive_global_at,
+            "proactive_daily_count": self._proactive_daily_count,
+            "proactive_daily_date": self._proactive_daily_date,
+        }
+
+    def import_persistable(self, data: dict) -> None:
+        """载入持久化快照（on_load 调用）；过期/畸形项静默丢弃，不影响启动。
+
+        冷却时间戳按 ``_STALE_AFTER_SECONDS`` 过滤（与 _prune 同口径）；
+        每日计数仅在快照日期仍是"今天"时恢复，跨天自动作废。
+        """
+        if not isinstance(data, dict):
+            return
+        cutoff = time.time() - self._STALE_AFTER_SECONDS
+
+        def _load_ts_map(key: str) -> dict[str, float]:
+            raw = data.get(key)
+            if not isinstance(raw, dict):
+                return {}
+            result: dict[str, float] = {}
+            for k, v in raw.items():
+                try:
+                    ts = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if ts >= cutoff:
+                    result[str(k)] = ts
+            return result
+
+        self._last_react_at.update(_load_ts_map("last_react_at"))
+        self._last_bystander_at.update(_load_ts_map("last_bystander_at"))
+        self._last_proactive_at_chat.update(_load_ts_map("last_proactive_at_chat"))
+        try:
+            global_at = float(data.get("last_proactive_global_at", 0.0))
+        except (TypeError, ValueError):
+            global_at = 0.0
+        if global_at >= cutoff:
+            self._last_proactive_global_at = max(self._last_proactive_global_at, global_at)
+        daily_date = str(data.get("proactive_daily_date") or "")
+        if daily_date and daily_date == format_local_date(time.time()):
+            try:
+                count = int(data.get("proactive_daily_count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            if count > self._proactive_daily_count:
+                self._proactive_daily_date = daily_date
+                self._proactive_daily_count = count
 
     # ----- prune / clear -----
 
