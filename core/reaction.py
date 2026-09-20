@@ -521,8 +521,8 @@ class ReactionExecutor:
         与原行为一致）。>0 时用 ``message.get_recent`` + ``message.build_readable``
         拉取最近若干条并格式化，让被戳回复能接住群里 / 对话正在聊的话题。
 
-        这两次 RPC 在 ``_send_llm_reply`` 的思考延迟 / 生成 gather **之前**串行，
-        故仅在用户主动开启（>0）时才付出这点拉取延迟；任一步失败一律降级为空串，
+        这两次 RPC 与 persona 解析、generate 一起放在 ``_send_llm_reply`` 中与思考延迟
+        并行的准备链里，耗时被"装作在思考"的延迟吸收；任一步失败一律降级为空串，
         绝不影响主回复生成。
         """
         cfg = self._plugin.config.reaction

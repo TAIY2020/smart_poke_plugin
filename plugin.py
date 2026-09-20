@@ -657,9 +657,7 @@ class SmartPokePlugin(MaiBotPlugin):
     async def handle_poke_event(self, message: dict | None = None, **kwargs):
         del kwargs
 
-        if not self.config.plugin.enabled:
-            return None
-
+        # plugin.enabled=False 由 Host 处理（不激活 / 卸载插件），此处无需自查。
         ctx = self._extract_poke_context(message)
         if ctx is None:
             return None
@@ -771,8 +769,6 @@ class SmartPokePlugin(MaiBotPlugin):
         所以戳一戳通知不会触发主动戳，避免事件回声。
         """
         del kwargs
-        if not self.config.plugin.enabled:
-            return None
         self._proactive.observe_signal(message)
         return None
 

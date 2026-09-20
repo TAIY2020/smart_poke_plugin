@@ -27,6 +27,30 @@ CONFIG_SCHEMA_VERSION = "1.8.0"
 RESPECT_SPAM_WINDOW_MAX_SECONDS = 3600
 
 
+def _normalize_id_list(value: Any) -> list[str]:
+    """把 QQ 号 / 群号列表统一归一化为去空白的字符串列表。
+
+    pydantic v2 不会把 int 自动转成 str：用户在 config.toml 里写 ``blacklist = [12345]``
+    （TOML 里裸数字很自然）会让 ``list[str]`` 校验直接失败——启动时插件标记 FAILED 不激活，
+    热更新时则整次更新被拒绝、静默保留旧配置。这里在校验前先转字符串并丢弃空项，
+    与运行时 ``_refresh_user_sets`` 的 ``str(x).strip()`` 口径一致。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, int)):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    for item in value:
+        if item is None or isinstance(item, bool):
+            continue
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
 def _warn_if_delay_range_inverted(section: str, min_delay: float, max_delay: float) -> None:
     """配置告警：``max_delay < min_delay`` 时打一条 warning 提示。
 
@@ -465,6 +489,11 @@ class UserControlSection(PluginConfigBase):
         json_schema_extra={"label": "忽略自戳"},
     )
 
+    @field_validator("blacklist", mode="before")
+    @classmethod
+    def _normalize_blacklist(cls, value: Any) -> list[str]:
+        return _normalize_id_list(value)
+
 
 class EmojiSection(PluginConfigBase):
     """表情包反应配置。"""
@@ -762,6 +791,11 @@ class ProactiveSection(PluginConfigBase):
         description="群黑名单：永不在这些群里主动戳",
         json_schema_extra={"label": "群黑名单"},
     )
+
+    @field_validator("whitelist_groups", "blacklist_groups", mode="before")
+    @classmethod
+    def _normalize_group_lists(cls, value: Any) -> list[str]:
+        return _normalize_id_list(value)
 
     @field_validator("target_strategy", mode="before")
     @classmethod

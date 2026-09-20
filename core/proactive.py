@@ -227,8 +227,12 @@ class ProactivePoker:
                 # 锁内只预占 in-flight 防并发双发；每日额度与群/全局长冷却推迟到
                 # send_poke 成功后再由 commit_proactive 计入，避免风控/超时/取消时
                 # "没戳出去却扣了配额"。in-flight 期间其他群的并发任务会在此退避。
-                # 传思考延迟上限做动态 TTL，并接住令牌供 commit/abort 防误清。
-                inflight_token = plugin._state.begin_proactive_inflight(cfg.max_delay_seconds)
+                # 传思考延迟的实际上界做动态 TTL，并接住令牌供 commit/abort 防误清。
+                # 锁外抽样用 hi = max(lo, max_delay)：误配 min > max 时实际延迟可达 min，
+                # 若只传 max_delay，in-flight 会在思考延迟结束前过期、放其他群穿过全局冷却。
+                inflight_token = plugin._state.begin_proactive_inflight(
+                    max(cfg.min_delay_seconds, cfg.max_delay_seconds)
+                )
 
         # ----- 锁外：思考延迟 + 出手 -----
         committed = False

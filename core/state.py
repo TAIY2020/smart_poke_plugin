@@ -115,6 +115,9 @@ class PokeStateManager:
     # 单条暴戳计数 deque 的硬上限——暴戳判定只关心 >= spam_threshold，多余的旧记录
     # 会被天然挤出而不影响判定结果。
     _POKE_RECORD_MAXLEN = 200
+    # 单个会话反应频率窗口 deque 的硬上限：配置 max_reactions_per_minute 上限 60，
+    # 留足余量即可。
+    _REACTION_WINDOW_MAXLEN = 200
     # 主动戳 in-flight 预占的基础时长下限：覆盖"锁外思考延迟 + 昵称解析 + send_poke RPC"；
     # 实际 TTL 取 max(本下限, 思考延迟上限 + RPC 余量)，避免 max_delay_seconds 调大后
     # in-flight 在思考延迟期内提前过期、让其他群穿过全局冷却/每日上限（见 begin_proactive_inflight）。
@@ -138,7 +141,12 @@ class PokeStateManager:
         # 同口径）：与逐人冷却互补，防同一会话内多人轮番车轮战。分桶而非全局，避免某群被
         # 刷屏时填满唯一的全局窗口、误伤其他群的正常用户。跟风戳/主动戳有各自的冷却+日上限，
         # 不占用此窗口。
-        self._reaction_window: dict[str, deque[float]] = defaultdict(deque)
+        # 桶容量与 _poke_records 同样封顶：max_reactions_per_minute=0 时 peek 不会被调用来
+        # 修剪过期项，只能靠 _prune 兜底；有 maxlen 可防两次 _prune 之间无界增长
+        # （上限只关心 >= max_per_minute（≤60），多余旧记录被挤出不影响判定）。
+        self._reaction_window: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PokeStateManager._REACTION_WINDOW_MAXLEN)
+        )
         # name=""为负缓存条目（已知该用户没有可解析昵称），TTL 配更短。
         self._name_cache: dict[str, tuple[str, float]] = {}
         self._stream_id_cache: dict[str, tuple[str, float]] = {}
@@ -632,7 +640,9 @@ class PokeStateManager:
                     continue
                 # 与内存中已有记录合并去重后按时间排序，保持 deque 的单调性（peek 依赖左端最旧）
                 merged = sorted(set(self._reaction_window[str(scope_key)]) | set(restored))
-                self._reaction_window[str(scope_key)] = deque(merged)
+                self._reaction_window[str(scope_key)] = deque(
+                    merged, maxlen=self._REACTION_WINDOW_MAXLEN
+                )
 
     # ----- prune / clear -----
 
@@ -674,7 +684,9 @@ class PokeStateManager:
                 window.popleft()
             if window:
                 pruned_windows[scope_key] = window
-        self._reaction_window = defaultdict(deque, pruned_windows)
+        self._reaction_window = defaultdict(
+            lambda: deque(maxlen=PokeStateManager._REACTION_WINDOW_MAXLEN), pruned_windows
+        )
         self._name_cache = {k: v for k, v in self._name_cache.items() if v[1] >= now}
         self._stream_id_cache = {k: v for k, v in self._stream_id_cache.items() if v[1] >= now}
         # 与 _last_proactive_at_chat 同源 prune：保留期内没主动戳过的群锁可清；
