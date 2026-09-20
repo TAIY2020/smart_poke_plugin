@@ -79,6 +79,16 @@ class BystanderPoker:
         if delay > 0:
             await asyncio.sleep(delay)
 
+        # 延迟期间配置可能已热更新：关闭跟风 / 群聊响应、或目标被拉黑，则放弃在途跟风戳
+        # （maybe_trigger 只在派发时检查过一次；这里读到的 config / _blacklist 已是最新）。
+        cfg = plugin.config.bystander
+        if not cfg.enabled or not plugin.config.reaction.react_in_group:
+            plugin.ctx.logger.debug("[bystander] 延迟期间跟风戳或群聊响应已关闭，放弃本次跟风")
+            return
+        if target_id in plugin._blacklist:
+            plugin.ctx.logger.debug("[bystander] 延迟期间目标 %s 已被加入黑名单，放弃本次跟风", target_id)
+            return
+
         # 跟风对象是被戳者且消息未带其名片时按需补解析；用局部变量承接，不写回入参 ctx
         # （ctx 由 _extract_poke_context 每次新建、本不共享，改入参仍是代码味道）。
         target_name = ctx.target_name
@@ -104,11 +114,16 @@ class BystanderPoker:
                 injected_name = ctx.poker_name
             else:
                 injected_name = ""
+            # 写入上下文需要该群会话在 Host 侧真实存在（冷群只被互戳过、从未有正常消息时并不存在）：
+            # 与被戳反应同口径，带路由身份幂等确保会话后再写；未开启写入时不发这次 RPC。
+            stream_id = ctx.stream_id
+            if plugin.config.plugin.record_self_poke_to_context:
+                stream_id = await plugin.resolve_stream_id_for_context(ctx, allow_open=True) or ctx.stream_id
             await plugin.record_self_poke_to_context(
                 label="bystander",
                 target_id=target_id,
                 target_name=injected_name,
                 group_id=ctx.group_id,
                 is_group=ctx.is_group,
-                stream_id=ctx.stream_id,
+                stream_id=stream_id,
             )

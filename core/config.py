@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.7.6"
+CONFIG_SCHEMA_VERSION = "1.8.0"
 
 
 # proactive.respect_spam_window_seconds 的有效上限：与 state.PokeStateManager._STALE_AFTER_SECONDS
@@ -69,13 +69,36 @@ class PluginSection(PluginConfigBase):
     record_self_poke_to_context: bool = Field(
         default=False,
         description=(
-            "是否把麦麦自己的戳一戳互动写入对应聊天流的 Maisaka 上下文"
+            "是否把麦麦自己的戳一戳互动写入对应聊天流的 Maisaka 上下文。"
+            "开启后，NapCat 回灌的『麦麦戳了别人』回声通知会被本插件吞掉，"
+            "避免与插件写入的『我戳了戳X』在上下文里重复出现"
         ),
         json_schema_extra={
             "label": "[实验性] 把自己的戳与回复写入上下文",
-            "hint": "默认关闭；开启后回复内容以正常聊天记录形式进上下文，戳动作以 QQ 原生提示风格记录",
+            "hint": (
+                "默认关闭；开启后回复内容以正常聊天记录形式进上下文，戳动作以 QQ 原生提示风格记录，"
+                "并吞掉 NapCat 回灌的自己戳人回声以免重复"
+            ),
         },
     )
+    adapter_plugin_id: str = Field(
+        default="",
+        description=(
+            "提供 adapter.napcat.* API 的适配器插件 ID。留空时按短名调用，由 Host 自动定位唯一提供方；"
+            "NapCat 与 SnowLuma 两个兼容适配器同时启用时短名不唯一、Host 会拒绝调用，"
+            "此时填写要使用的那个（maibot-team.napcat-adapter 或 maibot-team.snowluma-adapter）"
+        ),
+        json_schema_extra={
+            "label": "适配器插件 ID",
+            "hint": "留空自动；两个 NapCat 兼容适配器同时启用时填其一，如 maibot-team.napcat-adapter",
+            "placeholder": "留空自动定位",
+        },
+    )
+
+    @field_validator("adapter_plugin_id", mode="before")
+    @classmethod
+    def _normalize_adapter_plugin_id(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
 
 
 class ReactionSection(PluginConfigBase):
@@ -280,7 +303,7 @@ class ReactionSection(PluginConfigBase):
         default="planner",
         description=(
             "LLM 反应档使用的模型任务槽位（对应 Host model_task_config 下的任务名，"
-            "Host 按 task 名路由到该槽位配置的模型）。"
+            "以 task_name 下发、Host 按任务路由到该槽位配置的模型；需 Host ≥ 1.2.5）。"
             "utils=通用快模型；"
             "replyer=主回复模型(最贴人设但可能较慢)；planner=规划快模型。"
             "只能在这几个槽位里选，不要手填具体模型名"

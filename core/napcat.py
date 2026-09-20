@@ -4,6 +4,8 @@
 
 * 识别 Host / Adapter 包装后的 ``send_poke`` 失败信封
 * 失败日志按 label + 时间窗口抑制，避免风控期相同栈刷屏
+* API 名经 ``SmartPokePlugin.adapter_api_name`` 解析：配置了 ``plugin.adapter_plugin_id``
+  时拼成 ``<插件ID>.<短名>`` 全名，避免两个 NapCat 兼容适配器同时启用时短名不唯一被 Host 拒绝
 
 调用方拿到 ``True`` 即可认为请求已被 NapCat 接受；返回 ``False`` 时已自动打过日志，
 调用方按"未送达"走兜底（如回戳失败回退到文字回复）。
@@ -63,7 +65,7 @@ class NapcatPokeClient:
 
         try:
             resp = await self._plugin.ctx.api.call(
-                "adapter.napcat.message.send_poke", **call_kwargs
+                self._plugin.adapter_api_name("adapter.napcat.message.send_poke"), **call_kwargs
             )
             # 宿主层 RPC 无响应 / 反序列化失败时返回 None，按"未成功"处理让上层走兜底
             if resp is None:

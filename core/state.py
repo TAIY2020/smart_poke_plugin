@@ -4,8 +4,9 @@
     * ``PokeContext`` —— 从一次戳事件解析出的关键字段。
     * ``PokeStateManager`` —— 冷却、暴戳计数、各种 TTL 缓存、主动戳每日上限/锁的集中持有者。
 
-运行时仅持有内存态；冷却/每日上限等限频字段经 export_persistable /
-import_persistable 由插件层在卸载/加载时落盘与恢复，其余缓存热重载丢失（接受）。
+运行时仅持有内存态；冷却/每日上限/每分钟反应窗口等限频字段经 export_persistable /
+import_persistable 由插件层在卸载/加载与定期落盘时导出与恢复（文件 IO 由插件层放进
+线程池，本层的导出导入只在事件循环线程操作内存字典），其余缓存热重载丢失（接受）。
 所有方法都是同步的；与事件循环交互的部分由
 ``ProactivePoker`` / ``ReactionExecutor`` 等模块自行处理。
 """
@@ -31,6 +32,10 @@ STREAM_ID_CACHE_TTL_SECONDS = 1800.0
 # 在两次 _prune 之间无界增长（_prune 仅每 _PRUNE_THRESHOLD 次戳才触发一次）。
 STREAM_ID_CACHE_MAX_SIZE = 256
 
+# 「每分钟反应上限」的滑动窗口长度（秒）。peek / 快照导出导入都按此口径，
+# 避免调用点各自写死 60 而与持久化过滤口径漂移。
+REACTION_WINDOW_SECONDS = 60
+
 
 # ----- PokeContext -----
 
@@ -48,6 +53,8 @@ class PokeContext:
         "target_name",
         "group_id",
         "stream_id",
+        "account_id",
+        "scope",
         "cooldown_key",
         "spam_scope_key",
     )
@@ -63,6 +70,10 @@ class PokeContext:
         self.target_name: str = ""
         self.group_id: str = ""
         self.stream_id: str = ""
+        # 入站路由身份（Host 算 session_id 时混入的 bot 账号 / 连接作用域），
+        # chat.open_session 必须原样带上才能打开与入站同一条流；取不到为空串。
+        self.account_id: str = ""
+        self.scope: str = ""
         # 冷却维度：群聊用 group_id、私聊用 poker_id（稳定，不混 stream_id 以免漂移分裂）
         self.cooldown_key: str = ""
         # 与 cooldown_key 解耦：proactive 分支查 _poked_bot_recently 只能传 group_id，
@@ -72,6 +83,16 @@ class PokeContext:
     @property
     def is_poking_bot(self) -> bool:
         return bool(self.self_id) and self.target_id == self.self_id
+
+    @property
+    def chat_type(self) -> str:
+        """Host ``chat.open_session`` 口径的会话类型：``group`` / ``private``。"""
+        return "group" if self.is_group else "private"
+
+    @property
+    def session_target_id(self) -> str:
+        """会话目标 ID：群聊为群号、私聊为对方 QQ（与 open_session 的 group_id / user_id 对应）。"""
+        return self.group_id if self.is_group else self.poker_id
 
 
 # ----- PokeStateManager -----
@@ -85,6 +106,8 @@ class PokeStateManager:
     # config.proactive.respect_spam_window_seconds 的有效上限——_poke_records 中更早的
     # 「戳过麦麦」记录会被本阈值回收、不再能被 poked_bot_recently 命中，故 config 侧
     # RESPECT_SPAM_WINDOW_MAX_SECONDS 与此对齐；若调整本值，记得同步 config 侧上限。
+    # 主动戳的同群 / 全局冷却时间戳不受此阈值约束：其保留期由 set_proactive_retention_seconds
+    # 按配置冷却上调（配置允许长达一天，按 1 小时回收会让长冷却提前失效）。
     _STALE_AFTER_SECONDS = 3600
     # 主动戳观察等"高频但不戳麦麦"的路径按此最小间隔节流触发 _prune，避免该环境下
     # _prune（原仅靠被动戳计数触发）长期不跑、_proactive_locks/_last_*_at 随群数累积。
@@ -121,6 +144,9 @@ class PokeStateManager:
         self._stream_id_cache: dict[str, tuple[str, float]] = {}
         self._last_proactive_at_chat: dict[str, float] = {}
         self._last_proactive_global_at: float = 0.0
+        # 主动戳冷却时间戳的保留期（秒）：_prune / import_persistable 按它过滤同群与全局
+        # 冷却记录。默认与通用 stale 阈值相同，插件层按配置的 per_chat / global 冷却上调。
+        self._proactive_retention_seconds: float = float(self._STALE_AFTER_SECONDS)
         # 主动戳 in-flight 预占截止时间：begin 设、commit/abort 仅在令牌匹配时清；
         # in_proactive_global_cooldown 据此把"进行中/失败退避中"也视为全局占用。
         self._proactive_inflight_until: float = 0.0
@@ -136,6 +162,19 @@ class PokeStateManager:
         # OBSERVE 阶段拿不到 self_id，从 napcat additional_config / payload 学到后缓存于此；
         # 用于过滤"自己说话触发主动戳"等边界场景。拿不到也不致命。
         self._known_self_id: str = ""
+        # 可持久化状态的修订号：每次 mark_reacted / mark_bystander / mark_proactive 自增，
+        # 插件层的定期落盘任务据此判断"自上次写盘后是否有变化"，无变化则跳过写盘。
+        self._persist_version: int = 0
+
+    # ----- 持久化修订号 -----
+
+    @property
+    def persist_version(self) -> int:
+        """可持久化状态的修订号，仅在限频状态发生实际变更时递增。"""
+        return self._persist_version
+
+    def _bump_persist_version(self) -> None:
+        self._persist_version += 1
 
     # ----- self_id -----
 
@@ -203,6 +242,8 @@ class PokeStateManager:
         # 无 scope_key 时不入窗（无法定位会话维度，本就不参与频率限制）。
         if scope_key:
             self._reaction_window[scope_key].append(now)
+        if key or scope_key:
+            self._bump_persist_version()
         return now
 
     def is_reaction_superseded(
@@ -248,6 +289,7 @@ class PokeStateManager:
     def mark_bystander(self, scope_key: str) -> None:
         if scope_key:
             self._last_bystander_at[scope_key] = time.time()
+            self._bump_persist_version()
 
     # ----- 暴戳计数 -----
 
@@ -316,8 +358,15 @@ class PokeStateManager:
             return f"group:{group_id}"
         return f"user:{user_id}" if user_id else ""
 
-    def get_cached_stream_id(self, *, group_id: str, user_id: str) -> str | None:
-        key = self._stream_cache_key(group_id=group_id, user_id=user_id)
+    @staticmethod
+    def _session_cache_key(*, chat_type: str, target_id: str, account_id: str, scope: str) -> str:
+        """「已确保存在」的会话缓存键：与只读反查缓存（``group:``/``user:`` 前缀）分开存放，
+        并把路由身份揉进键里——不同 bot 账号 / 连接作用域对同一个群是不同的流。"""
+        if not chat_type or not target_id:
+            return ""
+        return f"session:{chat_type}:{target_id}@{account_id}/{scope}"
+
+    def _get_cached_stream_entry(self, key: str) -> str | None:
         if not key:
             return None
         entry = self._stream_id_cache.get(key)
@@ -329,13 +378,8 @@ class PokeStateManager:
             return None
         return stream_id
 
-    def cache_stream_id(
-        self, *, group_id: str, user_id: str, stream_id: str, ttl: float
-    ) -> None:
-        if not stream_id:
-            return
-        key = self._stream_cache_key(group_id=group_id, user_id=user_id)
-        if not key:
+    def _put_stream_entry(self, key: str, stream_id: str, ttl: float) -> None:
+        if not key or not stream_id:
             return
         self._stream_id_cache[key] = (stream_id, time.time() + ttl)
         if len(self._stream_id_cache) > STREAM_ID_CACHE_MAX_SIZE:
@@ -349,7 +393,49 @@ class PokeStateManager:
             )[: STREAM_ID_CACHE_MAX_SIZE // 2]
             self._stream_id_cache = dict(kept)
 
+    def get_cached_stream_id(self, *, group_id: str, user_id: str) -> str | None:
+        """只读反查（get_stream_by_*）结果的缓存。"""
+        return self._get_cached_stream_entry(self._stream_cache_key(group_id=group_id, user_id=user_id))
+
+    def cache_stream_id(
+        self, *, group_id: str, user_id: str, stream_id: str, ttl: float
+    ) -> None:
+        self._put_stream_entry(self._stream_cache_key(group_id=group_id, user_id=user_id), stream_id, ttl)
+
+    def get_cached_session_id(
+        self, *, chat_type: str, target_id: str, account_id: str, scope: str
+    ) -> str | None:
+        """``chat.open_session`` 已确保存在的会话 ID 缓存（按路由身份区分）。"""
+        return self._get_cached_stream_entry(
+            self._session_cache_key(chat_type=chat_type, target_id=target_id, account_id=account_id, scope=scope)
+        )
+
+    def cache_session_id(
+        self, *, chat_type: str, target_id: str, account_id: str, scope: str, session_id: str, ttl: float
+    ) -> None:
+        self._put_stream_entry(
+            self._session_cache_key(chat_type=chat_type, target_id=target_id, account_id=account_id, scope=scope),
+            session_id,
+            ttl,
+        )
+
     # ----- 主动戳：冷却与日上限 -----
+
+    def set_proactive_retention_seconds(self, seconds: float) -> None:
+        """设置主动戳冷却时间戳的保留期，不低于通用 stale 阈值。
+
+        插件层按 ``max(per_chat_cooldown_seconds, global_cooldown_seconds)`` 传入：
+        配置允许这两个冷却长达 86400s，若仍按 ``_STALE_AFTER_SECONDS``（3600s）回收 /
+        过滤快照，超过一小时的长冷却会被 ``_prune`` 或 ``import_persistable`` 提前抹掉。
+        """
+        try:
+            retention = float(seconds)
+        except (TypeError, ValueError):
+            retention = 0.0
+        self._proactive_retention_seconds = max(float(self._STALE_AFTER_SECONDS), retention)
+
+    def _proactive_cutoff(self, now: float) -> float:
+        return now - self._proactive_retention_seconds
 
     def in_proactive_chat_cooldown(self, group_id: str, cooldown_seconds: int) -> bool:
         if cooldown_seconds <= 0 or not group_id:
@@ -384,6 +470,7 @@ class PokeStateManager:
             self._proactive_daily_date = today
             self._proactive_daily_count = 0
         self._proactive_daily_count += 1
+        self._bump_persist_version()
 
     def begin_proactive_inflight(self, expected_delay: float = 0.0) -> int:
         """锁内调用：标记一次主动戳进行中（短期预占），阻止其他群并发穿过全局冷却。
@@ -456,12 +543,19 @@ class PokeStateManager:
     # ----- 持久化快照 -----
 
     def export_persistable(self) -> dict:
-        """导出值得跨重启保留的限频状态（卸载时由插件写盘）。
+        """导出值得跨重启保留的限频状态（由插件层写盘）。
 
         只挑"丢了会造成实际影响"的字段：冷却时间戳防重启后立即连戳、
-        每日计数防重启刷新主动戳额度。TTL 缓存 / 暴戳窗口 / in-flight 等
-        短命或运行时态不导出，加载后自然重建。
+        每日计数防重启刷新主动戳额度、会话级每分钟反应窗口防重载后多人
+        在同一分钟继续车轮战。TTL 缓存 / 暴戳窗口 / in-flight 等短命或
+        运行时态不导出，加载后自然重建。必须在事件循环线程调用（只读取
+        内存字典，不做文件 IO）。
         """
+        window_cutoff = time.time() - REACTION_WINDOW_SECONDS
+        reaction_window = {
+            scope_key: [ts for ts in window if ts >= window_cutoff]
+            for scope_key, window in self._reaction_window.items()
+        }
         return {
             "last_react_at": dict(self._last_react_at),
             "last_bystander_at": dict(self._last_bystander_at),
@@ -469,19 +563,25 @@ class PokeStateManager:
             "last_proactive_global_at": self._last_proactive_global_at,
             "proactive_daily_count": self._proactive_daily_count,
             "proactive_daily_date": self._proactive_daily_date,
+            "reaction_window": {k: v for k, v in reaction_window.items() if v},
         }
 
     def import_persistable(self, data: dict) -> None:
         """载入持久化快照（on_load 调用）；过期/畸形项静默丢弃，不影响启动。
 
-        冷却时间戳按 ``_STALE_AFTER_SECONDS`` 过滤（与 _prune 同口径）；
-        每日计数仅在快照日期仍是"今天"时恢复，跨天自动作废。
+        反应 / 跟风冷却时间戳按 ``_STALE_AFTER_SECONDS`` 过滤（与 _prune 同口径）；
+        主动戳同群 / 全局冷却按 ``_proactive_retention_seconds`` 过滤（调用前应先
+        ``set_proactive_retention_seconds``，否则长于 1 小时的冷却会被当过期丢弃）；
+        每日计数仅在快照日期仍是"今天"时恢复，跨天自动作废；每分钟反应窗口只恢复
+        仍在窗口内的记录。必须在事件循环线程调用。
         """
         if not isinstance(data, dict):
             return
-        cutoff = time.time() - self._STALE_AFTER_SECONDS
+        now = time.time()
+        cutoff = now - self._STALE_AFTER_SECONDS
+        proactive_cutoff = self._proactive_cutoff(now)
 
-        def _load_ts_map(key: str) -> dict[str, float]:
+        def _load_ts_map(key: str, min_ts: float) -> dict[str, float]:
             raw = data.get(key)
             if not isinstance(raw, dict):
                 return {}
@@ -491,21 +591,21 @@ class PokeStateManager:
                     ts = float(v)
                 except (TypeError, ValueError):
                     continue
-                if ts >= cutoff:
+                if ts >= min_ts:
                     result[str(k)] = ts
             return result
 
-        self._last_react_at.update(_load_ts_map("last_react_at"))
-        self._last_bystander_at.update(_load_ts_map("last_bystander_at"))
-        self._last_proactive_at_chat.update(_load_ts_map("last_proactive_at_chat"))
+        self._last_react_at.update(_load_ts_map("last_react_at", cutoff))
+        self._last_bystander_at.update(_load_ts_map("last_bystander_at", cutoff))
+        self._last_proactive_at_chat.update(_load_ts_map("last_proactive_at_chat", proactive_cutoff))
         try:
             global_at = float(data.get("last_proactive_global_at", 0.0))
         except (TypeError, ValueError):
             global_at = 0.0
-        if global_at >= cutoff:
+        if global_at >= proactive_cutoff:
             self._last_proactive_global_at = max(self._last_proactive_global_at, global_at)
         daily_date = str(data.get("proactive_daily_date") or "")
-        if daily_date and daily_date == format_local_date(time.time()):
+        if daily_date and daily_date == format_local_date(now):
             try:
                 count = int(data.get("proactive_daily_count", 0))
             except (TypeError, ValueError):
@@ -513,6 +613,26 @@ class PokeStateManager:
             if count > self._proactive_daily_count:
                 self._proactive_daily_date = daily_date
                 self._proactive_daily_count = count
+
+        raw_windows = data.get("reaction_window")
+        if isinstance(raw_windows, dict):
+            window_cutoff = now - REACTION_WINDOW_SECONDS
+            for scope_key, raw_list in raw_windows.items():
+                if not scope_key or not isinstance(raw_list, list):
+                    continue
+                restored: list[float] = []
+                for v in raw_list:
+                    try:
+                        ts = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if window_cutoff <= ts <= now:
+                        restored.append(ts)
+                if not restored:
+                    continue
+                # 与内存中已有记录合并去重后按时间排序，保持 deque 的单调性（peek 依赖左端最旧）
+                merged = sorted(set(self._reaction_window[str(scope_key)]) | set(restored))
+                self._reaction_window[str(scope_key)] = deque(merged)
 
     # ----- prune / clear -----
 
@@ -530,12 +650,18 @@ class PokeStateManager:
             self._prune()
 
     def _prune(self) -> None:
-        """删除超过 _STALE_AFTER_SECONDS 未更新的 key，控制字典体积。"""
-        cutoff = time.time() - self._STALE_AFTER_SECONDS
+        """删除超过保留期未更新的 key，控制字典体积。
+
+        反应 / 跟风冷却按 ``_STALE_AFTER_SECONDS``；主动戳同群冷却按更长的
+        ``_proactive_retention_seconds``（见 set_proactive_retention_seconds）。
+        """
+        now = time.time()
+        cutoff = now - self._STALE_AFTER_SECONDS
+        proactive_cutoff = self._proactive_cutoff(now)
         self._last_react_at = {k: v for k, v in self._last_react_at.items() if v >= cutoff}
         self._last_bystander_at = {k: v for k, v in self._last_bystander_at.items() if v >= cutoff}
         self._last_proactive_at_chat = {
-            k: v for k, v in self._last_proactive_at_chat.items() if v >= cutoff
+            k: v for k, v in self._last_proactive_at_chat.items() if v >= proactive_cutoff
         }
         self._poke_records = defaultdict(
             lambda: deque(maxlen=PokeStateManager._POKE_RECORD_MAXLEN),
@@ -549,10 +675,9 @@ class PokeStateManager:
             if window:
                 pruned_windows[scope_key] = window
         self._reaction_window = defaultdict(deque, pruned_windows)
-        now = time.time()
         self._name_cache = {k: v for k, v in self._name_cache.items() if v[1] >= now}
         self._stream_id_cache = {k: v for k, v in self._stream_id_cache.items() if v[1] >= now}
-        # 与 _last_proactive_at_chat 同源 prune：3600s 没主动戳过的群锁可清；
+        # 与 _last_proactive_at_chat 同源 prune：保留期内没主动戳过的群锁可清；
         # 但 lock.locked()=True 时仍跳过，避免移除"正持有中"的锁导致同群双发
         active_groups = set(self._last_proactive_at_chat.keys())
         self._proactive_locks = {
@@ -578,3 +703,4 @@ class PokeStateManager:
         self._last_prune_at = 0.0
         self._proactive_locks.clear()
         self._known_self_id = ""
+        self._persist_version = 0

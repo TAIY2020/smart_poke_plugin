@@ -14,7 +14,7 @@ import asyncio
 import random
 from typing import TYPE_CHECKING, Any
 
-from .state import PokeContext
+from .state import REACTION_WINDOW_SECONDS, PokeContext
 
 
 if TYPE_CHECKING:
@@ -58,7 +58,10 @@ class ReactionExecutor:
             # peek / in_cooldown / mark 三者连续同步执行（中间无 await），原子地占用冷却，
             # 避免与正常反应或另一次 silent_reply 撞车双发。
             max_per_minute = plugin.config.reaction.max_reactions_per_minute
-            if max_per_minute > 0 and plugin._state.peek_reaction_window(ctx.cooldown_key, 60) >= max_per_minute:
+            if (
+                max_per_minute > 0
+                and plugin._state.peek_reaction_window(ctx.cooldown_key, REACTION_WINDOW_SECONDS) >= max_per_minute
+            ):
                 plugin.ctx.logger.debug(
                     "[silent_reply] 派发到 mark 之间窗口被填满，静默放弃 (poker=%s)",
                     ctx.poker_id,
@@ -74,12 +77,15 @@ class ReactionExecutor:
                 return
             react_token = plugin._state.mark_reacted(ctx.cooldown_key, ctx.poker_id)
             await self._delay_a_bit()
-            # 同 react_to_poke：延迟后确认未被同一人更晚的反应取代，避免连戳叠加嘀咕
+            # 同 react_to_poke：延迟后确认未被同一人更晚的反应取代，避免连戳叠加嘀咕；
+            # 并复查热更新后的开关 / 黑名单，延迟期间被拉黑或关闭场景开关则放弃。
             if self._superseded(ctx, react_token, "silent_reply"):
+                return
+            if not self._reaction_still_allowed(ctx, "silent_reply"):
                 return
             # 确认会真正嘀咕一句后才记"对方戳了我"前因，与 react_to_poke 各档口径一致：
             # 被取代而放弃的任务不写入，避免上下文堆叠多条"X戳了戳我"。
-            await plugin.record_poked_by_to_context(ctx)
+            await plugin.record_poked_by_to_context(ctx, stream_id=stream_id)
             await self._safe_send_text(random.choice(pool), stream_id)
         except Exception:
             plugin.ctx.logger.exception("silent_reply 发送失败")
@@ -99,18 +105,21 @@ class ReactionExecutor:
         """
         plugin = self._plugin
         try:
-            # 先解析 stream_id 再延迟：避免选了 text/emoji/llm 但 stream_id 解析失败时
-            # 白白等掉几秒思考延迟才回退到回戳。回戳走 send_poke 不依赖 stream_id。
-            stream_id = await plugin.resolve_stream_id_for_context(ctx, allow_open=True)
-            if not stream_id:
-                plugin.ctx.logger.debug(
-                    "[smart_poke] 无法解析 stream_id (group=%s, poker=%s)，回退到回戳路径",
-                    ctx.group_id, ctx.poker_id,
-                )
-
             kind = self._decide_reaction_kind(is_spam)
-            if kind in ("emoji", "text", "llm") and not stream_id:
-                kind = "poke"
+            record_on = plugin.config.plugin.record_self_poke_to_context
+
+            # 仅当反应需要聊天流（文字/表情/LLM 走 ctx.send）或要写入上下文时才确保会话存在：
+            # 纯回戳走 send_poke 不依赖 stream_id，不为它凭空打开会话。
+            # 放在思考延迟之前：确保失败可立即回退到回戳，不白白等掉几秒思考延迟。
+            stream_id = ""
+            if kind != "poke" or record_on:
+                stream_id = await plugin.resolve_stream_id_for_context(ctx, allow_open=True)
+                if not stream_id and kind != "poke":
+                    plugin.ctx.logger.debug(
+                        "[smart_poke] 无法确保会话存在 (group=%s, poker=%s)，%s 档回退到回戳",
+                        ctx.group_id, ctx.poker_id, kind,
+                    )
+                    kind = "poke"
 
             # llm 档在 _send_llm_reply 内把思考延迟与生成 gather 并行以吸收延迟，
             # 不能再走这里的统一前置延迟；其余档保持"先延迟再发"。
@@ -121,11 +130,15 @@ class ReactionExecutor:
                 # 故这里只覆盖 poke/emoji/text。
                 if self._superseded(ctx, react_token, "smart_poke"):
                     return
+                # 延迟期间配置可能已热更新（拉黑该用户 / 关闭群聊或私聊响应）：发送前复查，
+                # 避免热更新之后仍把在途反应发出去。llm 档同样下沉到 gather 之后复查。
+                if not self._reaction_still_allowed(ctx, "smart_poke"):
+                    return
                 # 确认未被连戳取代、即将真正发出反应后，才记一条"对方戳了我"作为前因——
                 # 放在 supersede 之后，避免被取代而放弃的连戳任务也各写一条，导致上下文
                 # 堆叠多条"X戳了戳我"（关闭写入上下文时此调用直接返回）。llm 档的同口径
                 # 记录下沉到 _send_llm_reply 的 supersede 校验之后。
-                await plugin.record_poked_by_to_context(ctx)
+                await plugin.record_poked_by_to_context(ctx, stream_id=stream_id)
 
             plugin.ctx.logger.info(
                 "[smart_poke] 触发反应: kind=%s, is_spam=%s, poke_count=%d, poker=%s, scene=%s",
@@ -139,6 +152,9 @@ class ReactionExecutor:
             if kind == "poke":
                 ok = await self._send_back_poke(ctx, is_spam=is_spam, stream_id=stream_id)
                 if not ok:
+                    # 回戳失败才需要聊天流做文字兜底：此时再按需确保会话（前面为纯回戳跳过了）
+                    if not stream_id:
+                        stream_id = await plugin.resolve_stream_id_for_context(ctx, allow_open=True)
                     if stream_id:
                         await self._send_text(stream_id, is_spam)
                     else:
@@ -169,6 +185,8 @@ class ReactionExecutor:
                 # （RPC 硬异常导致的失败未走完延迟、时间窗口极短，此校验对其也安全无副作用。）
                 if self._superseded(ctx, react_token, "llm"):
                     return
+                if not self._reaction_still_allowed(ctx, "llm"):
+                    return
                 # LLM 失败级联回退：先回复池（延迟已在 _send_llm_reply 内消耗，不再补延迟），
                 # 再不行兜底回戳，避免 mark_reacted 了却什么都没发。
                 plugin.ctx.logger.debug(
@@ -176,7 +194,7 @@ class ReactionExecutor:
                 )
                 # 回退路径即将真正发出一条回复：补记"对方戳了我"前因（_send_llm_reply 仅在
                 # 成功发送前 record，生成失败时未记），同时唤醒 runtime 让回退回复 sync 能记入。
-                await plugin.record_poked_by_to_context(ctx)
+                await plugin.record_poked_by_to_context(ctx, stream_id=stream_id)
                 if await self._send_text(stream_id, is_spam):
                     return
                 plugin.ctx.logger.debug(
@@ -205,6 +223,28 @@ class ReactionExecutor:
         delay = random.uniform(lo, hi) if hi > 0 else 0
         if delay > 0:
             await asyncio.sleep(delay)
+
+    def _reaction_still_allowed(self, ctx: PokeContext, label: str) -> bool:
+        """发送前复查最新配置：热更新后被拉黑的用户、被关闭的群聊/私聊响应不再发出在途反应。
+
+        入口 Hook 只在派发时检查过一次，而反应真正发出在思考延迟之后；期间 on_config_update
+        已刷新 ``_blacklist`` 与配置实例，这里读到的就是最新值。命中时打 debug 并返回 ``False``。
+        （``plugin.enabled=False`` 由 Host 卸载插件、on_unload 取消所有在途任务，不在此复查。）
+        """
+        plugin = self._plugin
+        cfg = plugin.config.reaction
+        if ctx.poker_id in plugin._blacklist:
+            reason = "用户已被加入黑名单"
+        elif ctx.is_group and not cfg.react_in_group:
+            reason = "群聊响应已关闭"
+        elif not ctx.is_group and not cfg.react_in_private:
+            reason = "私聊响应已关闭"
+        else:
+            return True
+        plugin.ctx.logger.debug(
+            "[%s] 发送前复查未通过（%s），放弃本次反应 (poker=%s)", label, reason, ctx.poker_id,
+        )
+        return False
 
     def _superseded(
         self, ctx: PokeContext, react_token: float | None, label: str
@@ -284,6 +324,12 @@ class ReactionExecutor:
 
         any_success = False
         for i in range(times):
+            # 连戳之间有短延迟，期间用户可能被热更新拉黑：每一下发出前复查一次
+            if i > 0 and ctx.poker_id in plugin._blacklist:
+                plugin.ctx.logger.debug(
+                    "[back_poke] 连戳期间用户 %s 已被加入黑名单，停止后续回戳", ctx.poker_id,
+                )
+                break
             ok = await plugin._napcat.send_poke(
                 ctx.poker_id, ctx.group_id, is_group=ctx.is_group, label="back_poke"
             )
@@ -420,10 +466,14 @@ class ReactionExecutor:
                 "prompt": prompt,
                 "temperature": cfg.llm_temperature,
             }
-            model = cfg.llm_model.strip()
-            # llm_model 只会是 utils/replyer/planner（Literal 约束），直接作为任务槽位下发
-            if model:
-                gen_kwargs["model"] = model
+            task_name = cfg.llm_model.strip()
+            # llm_model 只会是 utils/replyer/planner（Literal 约束），作为任务槽位以 task_name
+            # 下发、model 留空——Host ≥ 1.2.5 按"请求里是否带 task_name 键"区分新旧协议：
+            # 带则 task_name 是任务、model/model_name 一律当具体模型名直选；不带才把 model
+            # 先按任务名解析。故不能再沿用旧写法 model=<槽位>，更不能 task_name 与 model
+            # 同传同一个值（会被当成直选模型名"planner"而找不到模型）。
+            if task_name:
+                gen_kwargs["task_name"] = task_name
             # max_tokens=0 表示不覆盖、用 Host 模型配置
             if cfg.llm_max_tokens > 0:
                 gen_kwargs["max_tokens"] = cfg.llm_max_tokens
@@ -448,14 +498,16 @@ class ReactionExecutor:
 
         # gather 已吸收思考延迟，发送前同样做二次确认。被取代时返回 True：这是主动放弃
         # 而非生成失败，返回 True 可让 react_to_poke 的 `if ok: return` 生效、不触发级联
-        # 回退再补发一条回复池/回戳。
+        # 回退再补发一条回复池/回戳。热更新拉黑 / 关闭场景响应同理按主动放弃处理。
         if self._superseded(ctx, react_token, "llm"):
+            return True
+        if not self._reaction_still_allowed(ctx, "llm"):
             return True
 
         # 确认未被取代、即将真正发出 llm 回复后才记"对方戳了我"前因，与非 llm 档口径一致：
         # 被连戳取代而放弃的任务不写入。生成失败（上方 return False）的回退发送由
         # react_to_poke 的 llm 回退分支补记，避免此处漏记前因 / 漏唤醒 runtime。
-        await plugin.record_poked_by_to_context(ctx)
+        await plugin.record_poked_by_to_context(ctx, stream_id=stream_id)
 
         ok = await self._safe_send_text(text, stream_id)
         if ok:

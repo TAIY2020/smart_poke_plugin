@@ -51,7 +51,7 @@ class ProactivePoker:
         # 最快每 _PRUNE_MIN_INTERVAL_SECONDS 一次），避免"只主动戳、很少有人戳麦麦"的
         # 环境下 _prune 长期不跑、_proactive_locks 等随群数累积。
         plugin._state.maybe_prune()
-        group_id, speaker_id = info
+        group_id, speaker_id, stream_id = info
         # 群级名单只依赖 group_id（O(1) set 查找），前移到派发前：名单外的群直接 return，
         # 不必 spawn 一个进 _maybe_poke 立刻退出的空任务、白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。
         # 黑名单优先；白名单非空时只放行名单内的群。
@@ -69,13 +69,17 @@ class ProactivePoker:
         if not in_active_hours(cfg.active_hour_start, cfg.active_hour_end, now_struct.tm_hour):
             return
         plugin._spawn_background_task(
-            self._maybe_poke(group_id, speaker_id), "proactive"
+            self._maybe_poke(group_id, speaker_id, stream_id), "proactive"
         )
 
     # ===== 候选信号提取 =====
 
-    def _extract_signal(self, message: Any) -> tuple[str, str] | None:
+    def _extract_signal(self, message: Any) -> tuple[str, str, str] | None:
         """快速排除：仅做廉价过滤，重活留给 ``_maybe_poke``。
+
+        返回 ``(group_id, speaker_id, stream_id)``；``stream_id`` 取消息自带的 session_id
+        （Host 派发 Hook 前已按路由身份算好回填），后续直接用它拉历史 / 写上下文，
+        省掉一次反查 RPC，多账号同群时也不会串到别的账号的流。
 
         顺便从 napcat codec 注入的 ``additional_config.self_id`` 学习当前 bot 账号——
         普通消息也会带，比等 notify.poke 提前得多。
@@ -114,11 +118,36 @@ class ProactivePoker:
         if known_self_id and speaker_id == known_self_id:
             return None
 
-        return group_id, speaker_id
+        stream_id = str(message.get("session_id") or "").strip()
+        return group_id, speaker_id, stream_id
 
     # ===== 主流程 =====
 
-    async def _maybe_poke(self, group_id: str, speaker_id: str) -> None:
+    def _still_allowed(self, group_id: str, target_id: str) -> bool:
+        """思考延迟后、出手前复查最新配置：主动戳被关闭、群被拉黑 / 移出白名单、目标被拉黑则放弃。
+
+        派发前的名单 / 开关检查只反映派发那一刻的配置；on_config_update 刷新集合与配置实例后，
+        这里读到的是最新值。命中时打 debug 并返回 ``False``，调用方走 in-flight 释放。
+        """
+        plugin = self._plugin
+        cfg = plugin.config.proactive
+        if not cfg.enabled:
+            reason = "主动戳已关闭"
+        elif group_id in plugin._proactive_blacklist_groups:
+            reason = "群已加入黑名单"
+        elif plugin._proactive_whitelist_groups and group_id not in plugin._proactive_whitelist_groups:
+            reason = "群已不在白名单"
+        elif target_id in plugin._blacklist:
+            reason = "目标用户已加入黑名单"
+        else:
+            return True
+        plugin.ctx.logger.debug(
+            "[proactive] 出手前复查未通过（%s），放弃本次主动戳 (group=%s, target=%s)",
+            reason, group_id, target_id,
+        )
+        return False
+
+    async def _maybe_poke(self, group_id: str, speaker_id: str, stream_id: str = "") -> None:
         """主动戳的完整判定与执行流程。
 
         双层锁：per-group lock 防同群双发，global lock 保护"全局冷却二次确认 + mark"
@@ -148,7 +177,9 @@ class ProactivePoker:
                 if already >= cfg.max_pokes_per_day:
                     return
 
-            stream_id = await plugin.resolve_stream_id_for_group(group_id)
+            # 优先用触发消息自带的 session_id；为空（异常适配器）才只读反查兜底
+            if not stream_id:
+                stream_id = await plugin.resolve_stream_id_for_group(group_id)
             if not stream_id:
                 plugin.ctx.logger.debug(
                     "[proactive] 群 %s 无法解析 stream_id，本次跳过", group_id,
@@ -208,6 +239,11 @@ class ProactivePoker:
             if delay > 0:
                 await asyncio.sleep(delay)
 
+            # 延迟期间配置可能已热更新：出手前复查开关 / 群名单 / 目标黑名单，
+            # 未通过则放弃（finally 释放 in-flight，不消耗每日额度与长冷却）
+            if not self._still_allowed(group_id, target_id):
+                return
+
             if not target_name:
                 resolved = await plugin.resolve_member_name(group_id, target_id)
                 if resolved:
@@ -224,7 +260,7 @@ class ProactivePoker:
                     "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",
                     cfg.target_strategy, group_id, target_name or target_id,
                 )
-                # 复用 _maybe_poke 里已 resolve 的 stream_id，省一次缓存查
+                # 复用触发消息自带 / _maybe_poke 里已解析的 stream_id，省一次缓存查
                 await plugin.record_self_poke_to_context(
                     label="proactive",
                     target_id=target_id,
