@@ -1,15 +1,15 @@
 """智能戳一戳插件 — MaiBot SDK v2
 
-通过 @HookHandler 订阅 chat.receive.before_process，识别 NapCat / SnowLuma 适配器
-注入的 notify.poke 事件，按拟人化策略回戳 / 发文字 / 发表情 / 沉默；
-另以 OBSERVE 模式观察普通消息，按概率触发主动戳。
+通过 @HookHandler 订阅 chat.receive.before_process：识别 NapCat / SnowLuma 适配器注入的
+notify.poke 事件，按拟人化策略回戳 / 发文字 / 发表情 / 沉默；其余入站消息交给主动戳模块，
+按概率触发主动戳。
 
-本文件为薄入口：仅持有 config schema 绑定、生命周期、限频快照持久化、会话解析与两个 Hook 的入口派发。
+本文件为薄入口：仅持有 config schema 绑定、生命周期、限频快照持久化、会话解析与 Hook 入口派发。
 具体执行链拆在 ``core`` 子包：
 
 * ``core.state.PokeStateManager`` —— 冷却/计数/缓存的集中持有者
 * ``core.napcat.NapcatPokeClient`` —— ``send_poke`` 调用 + 失败日志抑制
-* ``core.emoji.EmojiKeywordValidator`` —— 关键词探测 + 衰退 + 选表情
+* ``core.emoji.EmojiKeywordValidator`` —— 关键词与表情库标签匹配 + 选表情
 * ``core.reaction.ReactionExecutor`` —— 戳到麦麦的反应主流程（poke / emoji / text / llm）
 * ``core.bystander.BystanderPoker`` —— 别人互戳时跟风
 * ``core.proactive.ProactivePoker`` —— 群消息观察 + 主动戳完整链路
@@ -69,6 +69,8 @@ class SmartPokePlugin(MaiBotPlugin):
         self._blacklist: set[str] = set()
         self._proactive_whitelist_groups: set[str] = set()
         self._proactive_blacklist_groups: set[str] = set()
+        self._bystander_whitelist_groups: set[str] = set()
+        self._bystander_blacklist_groups: set[str] = set()
         self._pending_tasks: set[asyncio.Task] = set()
         # emoji 关键词探测任务句柄：热更新时取消上一轮未结束的探测，避免累积并发长轮询。
         self._emoji_probe_task: asyncio.Task | None = None
@@ -76,15 +78,11 @@ class SmartPokePlugin(MaiBotPlugin):
         self._snapshot_flush_task: asyncio.Task | None = None
         self._last_saved_persist_version: int = 0
         self._state = PokeStateManager()
-        # global 锁保护"全局冷却二次确认 + mark"临界区，避免不同群并发任务都穿过乐观快检。
-        # per-group 锁挂在 self._state.get_proactive_lock(group_id)，与 _last_proactive_at_chat
-        # 同源 prune，避免群数量上涨时锁字典无界增长。
-        self._proactive_global_lock: asyncio.Lock = asyncio.Lock()
         self._proactive_active_count: int = 0
         # on_unload 入口置 True，_spawn_background_task 据此拒收新任务。
         self._shutting_down: bool = False
 
-        # 5 个协作模块。每个都持 plugin 弱引用以访问 ctx/config/state。
+        # 5 个协作模块，都持有 plugin 引用以访问 ctx/config/state。
         self._napcat = NapcatPokeClient(self)
         self._emoji = EmojiKeywordValidator(self)
         self._reaction = ReactionExecutor(self)
@@ -124,16 +122,14 @@ class SmartPokePlugin(MaiBotPlugin):
         # clear() 之前落盘限频快照：重启/重载后冷却与每日上限得以延续，
         # 防止"重启即清零 → 立即连戳 / 主动戳额度刷新"。
         await self._save_state_snapshot(force=True)
-        self._state.clear()  # 同时清掉 _state 内的 _proactive_locks
+        self._state.clear()
 
     # ===== 限频状态持久化 =====
 
     def _state_snapshot_path(self) -> Path | None:
-        """限频快照文件路径（ctx.paths.data_dir 下）；目录不可用时返回 None 静默降级。"""
+        """限频快照文件路径（ctx.paths.data_dir 下）；取不到数据目录时返回 None 静默降级。"""
         try:
-            data_dir = Path(self.ctx.paths.data_dir)
-            data_dir.mkdir(parents=True, exist_ok=True)
-            return data_dir / "rate_limit_state.json"
+            return Path(self.ctx.paths.data_dir) / "rate_limit_state.json"
         except Exception as e:
             self.ctx.logger.warning("获取插件持久数据目录失败: %s；限频状态本次不持久化", e)
             return None
@@ -150,6 +146,7 @@ class SmartPokePlugin(MaiBotPlugin):
         """线程池内的纯文件写入：先写临时文件再原子替换，失败清理临时文件后重新抛出。"""
         tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
                 f.flush()
@@ -224,19 +221,19 @@ class SmartPokePlugin(MaiBotPlugin):
         if scope == "self":
             self._refresh_user_sets()
             self._sync_state_retention()
-            self._emoji.reset()
             self.ctx.logger.info("配置已热更新完成。")
-            self._spawn_emoji_probe()
+            # 表情标签缓存与配置无关，只有关键词变了才需要重新匹配
+            if self._emoji.keywords_changed():
+                self._spawn_emoji_probe()
 
     def _refresh_user_sets(self) -> None:
+        # 各名单已由配置校验器归一化为去空白的非空字符串
         cfg = self.config
-        self._blacklist = {str(x).strip() for x in cfg.user_control.blacklist if str(x).strip()}
-        self._proactive_whitelist_groups = {
-            str(x).strip() for x in cfg.proactive.whitelist_groups if str(x).strip()
-        }
-        self._proactive_blacklist_groups = {
-            str(x).strip() for x in cfg.proactive.blacklist_groups if str(x).strip()
-        }
+        self._blacklist = set(cfg.user_control.blacklist)
+        self._proactive_whitelist_groups = set(cfg.proactive.whitelist_groups)
+        self._proactive_blacklist_groups = set(cfg.proactive.blacklist_groups)
+        self._bystander_whitelist_groups = set(cfg.bystander.whitelist_groups)
+        self._bystander_blacklist_groups = set(cfg.bystander.blacklist_groups)
 
     def _sync_state_retention(self) -> None:
         """把主动戳冷却配置同步给状态层作为其时间戳的保留期，防长冷却被 1 小时 stale 阈值提前清掉。"""
@@ -314,7 +311,7 @@ class SmartPokePlugin(MaiBotPlugin):
         if old is not None and not old.done():
             old.cancel()
         self._emoji_probe_task = self._spawn_background_task(
-            self._emoji.probe_keywords_at_startup(), "emoji_keyword_probe"
+            self._emoji.probe_keywords(), "emoji_keyword_probe"
         )
 
     # ===== 名字 / stream_id 解析（公开给协作模块复用，带 TTL 缓存）=====
@@ -340,9 +337,9 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                # info 为 adapter 返回的 dict；失败时是 {"success": False, ...}，各字段
-                # 取不到统一落到 name="" 走负缓存。extract_onebot_field 兼容 NapCat
-                # (data 已剥到顶层)与 SnowLuma 等(card/nickname 裹在 data 里)两类返回。
+                # 失败信封 {"success": False, ...} 取不到字段，统一落到 name="" 走负缓存。
+                # extract_onebot_field 兼容 data 已剥到顶层（NapCat / SnowLuma ≥ 1.0.0）
+                # 与包在 data 里（旧版 SnowLuma）两种返回。
                 name = extract_onebot_field(info, "card", "nickname")
             else:
                 user_int = to_positive_int(user_id)
@@ -353,8 +350,7 @@ class SmartPokePlugin(MaiBotPlugin):
                     user_id=user_int,
                     no_cache=False,
                 )
-                # get_stranger_info 仅有 nickname 字段；extract_onebot_field 兼容
-                # data 已剥离(NapCat)与未剥离(SnowLuma)两种返回结构。
+                # get_stranger_info 只有 nickname 字段
                 name = extract_onebot_field(info, "nickname")
         except Exception:
             self.ctx.logger.debug(
@@ -365,6 +361,8 @@ class SmartPokePlugin(MaiBotPlugin):
             )
             return ""
 
+        if name == user_id:
+            name = ""
         if name:
             self._state.cache_name(group_id, user_id, name, MEMBER_NAME_CACHE_TTL_SECONDS)
         else:
@@ -626,8 +624,14 @@ class SmartPokePlugin(MaiBotPlugin):
 
         ``stream_id`` 由调用方传入已确保存在的会话 ID（与随后 send 的目标一致）；为空时
         按只读路径解析。
+
+        同一次戳最多写一条：LLM 档生成成功、发送失败后，回退分支会再调一次本方法，
+        按 ``ctx.poked_by_recorded`` 去重。写入前就置位而非等成功再置——append 失败多是
+        会话不存在这类重试也没用的原因，超时重试反倒可能在 Host 已写入时再写一条。
         """
         if not self.config.plugin.record_self_poke_to_context:
+            return
+        if ctx.poked_by_recorded:
             return
         if not stream_id:
             stream_id = await self.resolve_stream_id_for_context(ctx)
@@ -638,7 +642,8 @@ class SmartPokePlugin(MaiBotPlugin):
             return
         poker = (ctx.poker_name or "").strip() or ctx.poker_id or "对方"
         action = (ctx.poke_action or "").strip() or "戳了戳"
-        text = f"{poker}{action}我"
+        text = f"{poker}{action}我{ctx.poke_suffix}"
+        ctx.poked_by_recorded = True
         await self._append_self_event_to_context(
             stream_id=stream_id, text=text, label="poked",
         )
@@ -648,34 +653,35 @@ class SmartPokePlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.before_process",
         name="smart_poke_listener",
-        description="识别并响应 napcat 注入的戳一戳通知事件",
+        description="响应戳一戳通知，并观察普通群消息按概率触发主动戳",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_poke_event(self, message: dict | None = None, **kwargs):
+        """Hook 入口：戳一戳走反应 / 跟风链路，其余消息交给主动戳观察。
+
+        主动戳观察与戳一戳共用这一个 Hook、不另挂 OBSERVE handler：Host 序列化消息时带着
+        图片 base64，每多一个 handler 就要把整条消息再往插件进程传一遍。
+        """
         del kwargs
+        # 每条入站消息都经过这里：按时间节流清理状态字典（O(1) 检查，真正的 _prune 有最小间隔）
+        self._state.maybe_prune()
 
         # plugin.enabled=False 由 Host 处理（不激活 / 卸载插件），此处无需自查。
         ctx = self._extract_poke_context(message)
         if ctx is None:
+            self._proactive.observe_signal(message)
             return None
-
-        # 戳事件（戳麦麦 / 别人互戳）是会写入冷却、暴戳计数、跟风冷却等状态字典的唯一入口，
-        # 且与 proactive.enabled 无关：在此按时间节流触发一次状态清理（O(1) 检查，实际
-        # _prune 最快每 _PRUNE_MIN_INTERVAL_SECONDS 一次）。兜底覆盖 observe_signal 的
-        # maybe_prune 够不到的路径——主动戳关闭、或纯「别人互戳跟风」场景下，否则 _prune
-        # 只能靠「戳麦麦累计 _PRUNE_THRESHOLD 次」触发，这些状态字典的清理会长期停滞。
-        self._state.maybe_prune()
 
         # ----- 分支一：戳的不是麦麦（别人互戳）-----
         if not ctx.is_poking_bot:
-            # send_poke 出去后 napcat 会回灌一条 poker_id=self_id 的事件（SnowLuma 在适配器侧
-            # 已丢弃，不会到这里），提前过滤掉多次连续回戳产生的 n 倍回声逐一走完整套检查的开销。
+            # 麦麦自己戳人后 NapCat 适配器会回灌一条 poker_id=self_id 的通知（SnowLuma 适配器
+            # 在适配器侧就丢弃了），提前过滤，免得连续回戳产生的回声逐一走完整套检查。
             if ctx.poker_id == ctx.self_id:
                 # 开启写入上下文时，插件已在 send_poke 成功后写过一条"我戳了戳X"；若再把回声
-                # 放行给 Host，Host 会把它当普通通知再记一条"麦麦 发起了戳一戳 -> X"，上下文重复。
+                # 放行给 Host，Host 会把它当普通通知再记一条，上下文重复。
                 # 关闭时保持放行，让 Host 自带的通知记录继续感知麦麦戳过谁。
                 if self.config.plugin.record_self_poke_to_context:
                     return {"action": "abort"}
@@ -734,7 +740,8 @@ class SmartPokePlugin(MaiBotPlugin):
                 "[%s] 戳一戳触发概率未命中，静默拦截", ctx.cooldown_key or ctx.poker_id
             )
             chat_prob = self.config.reaction.silent_chat_probability
-            if chat_prob > 0 and random.random() < chat_prob:
+            # 沉默回复池为空时挤不出话，别走这条路（否则会无视 swallow_when_silent 吞掉事件）
+            if chat_prob > 0 and self.config.fallback.silent_replies and random.random() < chat_prob:
                 self._spawn_background_task(self._reaction.silent_reply(ctx), "silent_reply")
                 return {"action": "abort"}
             if self.config.reaction.swallow_when_silent:
@@ -752,25 +759,6 @@ class SmartPokePlugin(MaiBotPlugin):
         )
 
         return {"action": "abort"}
-
-    @HookHandler(
-        "chat.receive.before_process",
-        name="smart_poke_proactive_observer",
-        description="观察普通群消息，按拟人化概率被勾起一次主动戳",
-        mode=HookMode.OBSERVE,
-        order=HookOrder.LATE,
-        timeout_ms=2000,
-        error_policy=ErrorPolicy.SKIP,
-    )
-    async def observe_message_for_proactive(self, message: dict | None = None, **kwargs):
-        """OBSERVE 旁路：每条入站群消息都被"考虑"一次，再交由 ProactivePoker 层层过滤。
-
-        主 BLOCKING handler 对戳一戳事件 ``abort`` 时 dispatcher 会先 ``break``，
-        所以戳一戳通知不会触发主动戳，避免事件回声。
-        """
-        del kwargs
-        self._proactive.observe_signal(message)
-        return None
 
     # ===== 信息提取 =====
 
@@ -828,14 +816,18 @@ class SmartPokePlugin(MaiBotPlugin):
         if not isinstance(user_info, dict):
             user_info = {}
 
-        # 群名片优先于 nickname，与 resolve_member_name 保持一致
-        poker_cardname = str(user_info.get("user_cardname") or "").strip()
-        poker_nickname = str(user_info.get("user_nickname") or "").strip()
+        # 群名片优先于 nickname，与 resolve_member_name 保持一致。适配器查不到成员资料时会把
+        # 昵称填成 QQ 号，这种"昵称"当作没有，免得提示词和上下文里出现一串数字。
+        poker_name = str(user_info.get("user_cardname") or "").strip() or str(
+            user_info.get("user_nickname") or ""
+        ).strip()
+        if poker_name == poker_id:
+            poker_name = ""
 
         ctx = PokeContext()
         ctx.self_id = self_id
         ctx.poker_id = poker_id
-        ctx.poker_name = poker_cardname or poker_nickname
+        ctx.poker_name = poker_name
         ctx.target_id = target_id
         # 主分支 target 是麦麦自己不需要昵称；跟风戳分支按需异步补 target_name
         ctx.target_name = ""
@@ -846,32 +838,36 @@ class SmartPokePlugin(MaiBotPlugin):
         ctx.stream_id = str(message.get("session_id") or "")
         ctx.account_id = account_id
         ctx.scope = scope
-        # 冷却维度用稳定的 group_id（群聊）/ poker_id（私聊），不混入 stream_id：
-        # notice 的 session_id 偶尔缺失会让 cooldown_key 在 stream_id 与 group_id 间漂移、
-        # 逐人冷却分裂成两个 key 而短暂失效。stream_id 只用于发送，不参与冷却 key。
+        # 冷却维度用稳定的 group_id（群聊）/ poker_id（私聊），不混入 stream_id。
         ctx.cooldown_key = ctx.group_id or ctx.poker_id
         ctx.spam_scope_key = ctx.group_id if ctx.is_group else ctx.poker_id
-        ctx.poke_action = self._extract_poke_action(payload)
+        ctx.poke_action, ctx.poke_suffix = self._extract_poke_texts(payload)
         return ctx
 
     @staticmethod
-    def _extract_poke_action(payload: dict) -> str:
-        """从 napcat poke notice 的 raw_info 提取自定义戳一戳动作文本（如"拍了拍""捏了捏"）。
+    def _extract_poke_texts(payload: dict) -> tuple[str, str]:
+        """从 poke notice 的 raw_info 提取自定义动作词与后缀（如"拍了拍"+"的脸"）。
 
-        napcat 在 poke notice 的 raw_info 里以
-        ``[{"type":"nor","txt":"拍了拍"}, {"type":"qq", ...}, {"type":"nor","txt":"的脸"}]``
-        形式给出，第一个 ``nor`` 文本即动作词；取不到（旧版 / 无该字段）返回空串，
-        由调用方兜底为"戳了戳"，因此 napcat 不发 raw_info 时也不会回归。
+        QQ 的 raw_info 形如 ``[qq(戳人者), img(图标), nor("拍了拍"), qq(被戳者), nor("的脸")]``：
+        第二个 ``qq`` 之前的 ``nor`` 文本是动作词，之后的是后缀。按 ``qq`` 分段而非取第一个
+        ``nor``，动作词为空时也不会把后缀错当成动作。取不到返回空串，由使用处兜底为"戳了戳"。
         """
         raw_info = payload.get("raw_info")
         if not isinstance(raw_info, list):
-            return ""
+            return "", ""
+        action_parts: list[str] = []
+        suffix_parts: list[str] = []
+        qq_seen = 0
         for col in raw_info:
-            if isinstance(col, dict) and col.get("type") == "nor":
+            if not isinstance(col, dict):
+                continue
+            if col.get("type") == "qq":
+                qq_seen += 1
+            elif col.get("type") == "nor":
                 txt = str(col.get("txt") or "").strip()
                 if txt:
-                    return txt
-        return ""
+                    (suffix_parts if qq_seen >= 2 else action_parts).append(txt)
+        return "".join(action_parts), "".join(suffix_parts)
 
 
 def create_plugin() -> SmartPokePlugin:

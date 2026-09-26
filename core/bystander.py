@@ -35,6 +35,11 @@ class BystanderPoker:
             return False
         if ctx.poker_id == ctx.self_id or ctx.target_id == ctx.self_id:
             return False
+        # 黑名单用户发起的互戳不跟风（否则 victim 策略下麦麦会帮他接着戳别人）
+        if ctx.poker_id in plugin._blacklist:
+            return False
+        if not self._group_allowed(ctx.group_id):
+            return False
         bystander_key = ctx.cooldown_key
         if plugin._state.in_bystander_cooldown(bystander_key, cfg.cooldown_seconds):
             return False
@@ -52,6 +57,13 @@ class BystanderPoker:
             "bystander",
         )
         return True
+
+    def _group_allowed(self, group_id: str) -> bool:
+        """群级名单：黑名单优先；白名单非空时只放行名单内的群。"""
+        plugin = self._plugin
+        if group_id in plugin._bystander_blacklist_groups:
+            return False
+        return not plugin._bystander_whitelist_groups or group_id in plugin._bystander_whitelist_groups
 
     def _pick_target(self, ctx: PokeContext) -> str:
         """按 target_strategy 挑选跟风对象；命中黑名单则返回空串而不退化策略。"""
@@ -79,18 +91,20 @@ class BystanderPoker:
         if delay > 0:
             await asyncio.sleep(delay)
 
-        # 延迟期间配置可能已热更新：关闭跟风 / 群聊响应、或目标被拉黑，则放弃在途跟风戳
-        # （maybe_trigger 只在派发时检查过一次；这里读到的 config / _blacklist 已是最新）。
+        # 延迟期间配置可能已热更新：关闭跟风 / 群聊响应、群被移出名单、发起者或目标被拉黑，
+        # 则放弃在途跟风戳（maybe_trigger 只在派发时检查过一次）。
         cfg = plugin.config.bystander
         if not cfg.enabled or not plugin.config.reaction.react_in_group:
             plugin.ctx.logger.debug("[bystander] 延迟期间跟风戳或群聊响应已关闭，放弃本次跟风")
             return
-        if target_id in plugin._blacklist:
-            plugin.ctx.logger.debug("[bystander] 延迟期间目标 %s 已被加入黑名单，放弃本次跟风", target_id)
+        if not self._group_allowed(ctx.group_id):
+            plugin.ctx.logger.debug("[bystander] 延迟期间群 %s 已不在跟风名单内，放弃本次跟风", ctx.group_id)
+            return
+        if target_id in plugin._blacklist or ctx.poker_id in plugin._blacklist:
+            plugin.ctx.logger.debug("[bystander] 延迟期间发起者或目标已被加入黑名单，放弃本次跟风")
             return
 
-        # 跟风对象是被戳者且消息未带其名片时按需补解析；用局部变量承接，不写回入参 ctx
-        # （ctx 由 _extract_poke_context 每次新建、本不共享，改入参仍是代码味道）。
+        # 跟风对象是被戳者时按需补解析其群名片（发起者的名字入站消息里已经带了）。
         target_name = ctx.target_name
         if ctx.is_group and ctx.group_id and target_id == ctx.target_id and not target_name:
             resolved = await plugin.resolve_member_name(ctx.group_id, target_id)

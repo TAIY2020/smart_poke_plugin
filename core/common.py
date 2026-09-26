@@ -55,10 +55,9 @@ def to_positive_int(value: Any) -> int | None:
 def extract_onebot_field(payload: Any, *keys: str) -> str:
     """按顺序取第一个非空字段值，兼容 ``data`` 已剥离与未剥离两种适配器返回。
 
-    NapCat 查询型 API 已把 OneBot 响应的 ``data`` 剥到顶层（``card`` / ``nickname``
-    直接可取）；部分 NapCat 兼容适配器（如 SnowLuma）则原样返回完整 OneBot 响应、
-    字段裹在 ``data`` 里。这里先在顶层按 ``keys`` 顺序找，全落空再钻一层 ``data``，
-    使昵称解析对两类适配器都成立。``payload`` 非 dict（如失败信封 / None）时返回 ""。
+    NapCat 与 SnowLuma ≥ 1.0.0 的查询型 API 已把 OneBot 响应的 ``data`` 剥到顶层；旧版
+    SnowLuma 原样返回完整响应、字段包在 ``data`` 里。这里先在顶层按 ``keys`` 顺序找，
+    全落空再钻一层 ``data``。``payload`` 非 dict（如失败信封 / None）时返回 ""。
     """
     if not isinstance(payload, dict):
         return ""

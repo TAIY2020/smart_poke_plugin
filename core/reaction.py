@@ -1,7 +1,7 @@
 """反应执行器：戳到麦麦后的反应主流程。
 
 被 ``SmartPokePlugin.handle_poke_event`` 在 ``react_probability`` 命中后调用。
-按权重抽样回戳 / 表情 / 文字三种反应；任意路径失败按既定级联回退避免 mark_reacted
+按权重抽样回戳 / 表情 / 文字 / LLM 四种反应；任意路径失败按既定级联回退，避免 mark_reacted
 了却什么都没发的尴尬。
 
 同时持有 ``silent_reply``——``react_probability`` 未命中时按 ``silent_chat_probability``
@@ -192,8 +192,9 @@ class ReactionExecutor:
                 plugin.ctx.logger.debug(
                     "[smart_poke] LLM 反应未发出，回退到回复池 (poker=%s)", ctx.poker_id,
                 )
-                # 回退路径即将真正发出一条回复：补记"对方戳了我"前因（_send_llm_reply 仅在
-                # 成功发送前 record，生成失败时未记），同时唤醒 runtime 让回退回复 sync 能记入。
+                # 回退路径即将真正发出一条回复：补记"对方戳了我"前因（生成失败时 _send_llm_reply
+                # 还没记；生成成功但发送失败时已记过，record_poked_by_to_context 按 ctx 去重、
+                # 不会重复），同时唤醒 runtime 让回退回复 sync 能记入。
                 await plugin.record_poked_by_to_context(ctx, stream_id=stream_id)
                 if await self._send_text(stream_id, is_spam):
                     return
@@ -353,9 +354,7 @@ class ReactionExecutor:
                 target_name=ctx.poker_name,
                 group_id=ctx.group_id,
                 is_group=ctx.is_group,
-                # 复用 react_to_poke 已解析（含冷群 open_session）的 stream_id，
-                # 避免 record 内部按 ctx.stream_id（notify 路径常为空）再回查一次；
-                # 解析失败时退回 ctx.stream_id，与原行为一致。
+                # 复用 react_to_poke 已确保存在的会话；为空时退回入站消息自带的 session_id。
                 stream_id=stream_id or ctx.stream_id,
             )
         return any_success
@@ -572,41 +571,38 @@ class ReactionExecutor:
         """组装精简 messages：system 放人设(+可选风格+可选聊天记录) + 任务约束，user 放被戳事件。
 
         ``persona`` 由 ``_resolve_persona`` 给出（已含全局人设回退）。语气默认完全交给
-        人设，仅当用户在 ``reaction.llm_response_style`` 填写时才追加一句风格约束
-        （issue #4：原先硬编码"不失讽刺"等会冲淡 / 带崩用户人设）。
+        人设，仅当用户在 ``reaction.llm_response_style`` 填写时才追加一句风格约束。
 
         ``context_text`` 为 ``_fetch_recent_context`` 按 ``reaction.llm_context_messages``
-        拉取的最近聊天记录：默认空（不拉历史、压低首 token 延迟，戳一戳是轻量交互）；
-        非空时作为氛围背景注入 system，并明确标注"仅供了解氛围、勿直接回复其内容"，
-        避免 LLM 把"回应被戳"跑偏成"回应聊天记录"。
+        拉取的最近聊天记录：非空时作为氛围背景注入 system，并明确标注"仅供了解氛围、
+        勿直接回复其内容"，避免 LLM 把"回应被戳"跑偏成"回应聊天记录"。
         """
         scene = "群聊" if ctx.is_group else "私聊"
         poker = (ctx.poker_name or "").strip() or "有人"
         action = (ctx.poke_action or "").strip() or "戳了戳"
+        # 完整动作描述，如"拍了拍你的脸"；没有后缀时就是"戳了戳你"
+        act_on_you = f"{action}你{ctx.poke_suffix}"
 
         system = (
             f"{persona}\n\n"
-            f"现在「{poker}」在 QQ {scene}里{action}你。"
-            f"请就「{action}」这个动作回应一句——要贴合「{action}」本身，别把它说成其它动作"
+            f"现在「{poker}」在 QQ {scene}里{act_on_you}。"
+            f"请就「{act_on_you}」这个动作回应一句——要贴合这个动作本身，别把它说成其它动作"
             f"（对方是「{action}」就别回成「戳」之类）。"
             "回复要很简短、很白话；只输出这句话本身，不要加引号 / 解释 / 前缀。"
         )
-        # 风格仅在用户显式配置时追加；留空则不塞任何固定腔调，让语气完全由 persona
-        # 主导（issue #4：硬编码"不失讽刺"会冲淡 / 带崩用户人设）。
+        # 风格仅在用户显式配置时追加，留空则语气完全由 persona 主导
         style = self._plugin.config.reaction.llm_response_style.strip()
         if style:
             system += f"\n额外回复风格要求：{style}"
-        # 可选注入最近聊天记录作为氛围参考（reaction.llm_context_messages > 0 时）：
-        # 明确标注只是背景、主回应对象仍是「被戳」这件事，避免 LLM 跑偏去答聊天内容。
         if context_text:
             system += (
                 "\n\n这是最近的聊天记录，仅供你了解当前氛围，不要直接回复其中的内容：\n"
                 f"{context_text}"
             )
         if is_spam:
-            user = f"{poker}连续{action}你好几下，很烦人，回一句。"
+            user = f"{poker}连续{act_on_you}好几下，很烦人，回一句。"
         else:
-            user = f"{poker}{action}你，回一句。"
+            user = f"{poker}{act_on_you}，回一句。"
 
         return [
             {"role": "system", "content": system},

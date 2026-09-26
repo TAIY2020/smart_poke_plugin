@@ -17,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.8.0"
+CONFIG_SCHEMA_VERSION = "1.9.0"
 
 
 # proactive.respect_spam_window_seconds 的有效上限：与 state.PokeStateManager._STALE_AFTER_SECONDS
@@ -501,13 +501,19 @@ class EmojiSection(PluginConfigBase):
     __ui_label__ = "表情包反应"
 
     description_keywords: list[str] = Field(
-        default_factory=lambda: ["疑惑", "无奈", "生气", "无语", "哼", "瞪"],
-        description="选择表情包时使用的描述关键词，将随机抽取其一调用 emoji.get_by_description",
-        json_schema_extra={"label": "表情关键词"},
+        default_factory=lambda: ["疑惑", "无奈", "生气", "无语", "嫌弃", "不满"],
+        description=(
+            "选择表情包时使用的关键词。关键词与表情库里的情绪标签互为子串才算匹配，"
+            "匹配不上的关键词会被跳过（启动日志会列出）；发出的表情也会按其标签复核相关性"
+        ),
+        json_schema_extra={
+            "label": "表情关键词",
+            "hint": "填表情库里实际有的情绪标签，匹配不上的词会被跳过",
+        },
     )
     allow_random_fallback: bool = Field(
         default=False,
-        description="按关键词没找到合适表情时是否回退到随机表情（默认关闭，更倾向于回戳）",
+        description="关键词都没取到相关表情时，是否改发一张随机表情（默认关闭，改为回戳或文字）",
         json_schema_extra={"label": "允许随机表情"},
     )
 
@@ -590,6 +596,24 @@ class BystanderSection(PluginConfigBase):
         description="跟风戳的最大延迟",
         json_schema_extra={"label": "最大延迟（秒）"},
     )
+    whitelist_groups: list[str] = Field(
+        default_factory=list,
+        description=(
+            "群白名单：只在这些群里跟风戳；为空表示『没有白名单限制』。"
+            "白名单与黑名单同时存在时，黑名单优先生效"
+        ),
+        json_schema_extra={"label": "群白名单"},
+    )
+    blacklist_groups: list[str] = Field(
+        default_factory=list,
+        description="群黑名单：永不在这些群里跟风戳",
+        json_schema_extra={"label": "群黑名单"},
+    )
+
+    @field_validator("whitelist_groups", "blacklist_groups", mode="before")
+    @classmethod
+    def _normalize_group_lists(cls, value: Any) -> list[str]:
+        return _normalize_id_list(value)
 
     @field_validator("target_strategy", mode="before")
     @classmethod
@@ -714,12 +738,12 @@ class ProactiveSection(PluginConfigBase):
         },
     )
     min_recent_messages: int = Field(
-        default=3,
+        default=5,
         ge=1,
         le=100,
         description=(
-            "群活跃门槛：recent_window_seconds 窗口内有效消息（去掉麦麦自己、通知事件）"
-            "至少要达到该数量才考虑出手，避免在死群里偶发触发"
+            "群活跃门槛：recent_window_seconds 窗口内有效消息（去掉麦麦自己、通知事件，"
+            "含触发本次判定的那条）至少要达到该数量才考虑出手，避免在死群里偶发触发"
         ),
         json_schema_extra={"label": "群活跃门槛（条）"},
     )

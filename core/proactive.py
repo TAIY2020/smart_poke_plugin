@@ -1,15 +1,11 @@
 """主动戳：群里有人说话时按拟人化概率被勾起来戳一下熟人。
 
-被 ``SmartPokePlugin.observe_message_for_proactive`` 在每条入站群消息上调用。
-``observe_signal`` 同步：仅做廉价快检 + 派发后台任务；重活在 ``_maybe_poke`` 完成。
+``SmartPokePlugin.handle_poke_event`` 对每条非戳一戳的入站消息调用 ``observe_signal``：
+它是同步的，只做廉价快检 + 派发后台任务，重活在 ``_maybe_poke`` 完成。
 
-双层锁：
-
-* per-group lock（``state.get_proactive_lock``）防同群双发；
-* global lock 保护"全局冷却二次确认 + mark"临界区——不同群的并发任务可能在各自
-  per-group lock 内同时穿过全局乐观快检。
-
-RPC 与延迟都在 per-group lock 内或锁外，避免全局串行所有群的网络往返。
+并发控制不用锁：入口的冷却 / 上限检查只是乐观快检，``get_recent`` 等 await 之后再同步复检并
+预占 in-flight（复检与预占之间没有 await，在单事件循环里天然原子）。in-flight 期间任何群的
+新任务都会被挡下；send_poke 成功后转正为冷却与每日额度，失败则留一小段全局退避。
 """
 
 from __future__ import annotations
@@ -35,11 +31,7 @@ class ProactivePoker:
     # ===== 公开入口 =====
 
     def observe_signal(self, message: Any) -> None:
-        """每条群消息都被"考虑"一次。
-
-        主 BLOCKING handler 对戳一戳事件 ``abort`` 时 dispatcher 会先 ``break``，
-        所以戳一戳通知不会触发主动戳，避免事件回声。
-        """
+        """每条入站群消息都被"考虑"一次（通知类消息由 ``_extract_signal`` 排除）。"""
         plugin = self._plugin
         cfg = plugin.config.proactive
         if not cfg.enabled:
@@ -47,41 +39,37 @@ class ProactivePoker:
         info = self._extract_signal(message)
         if info is None:
             return
-        # 主动戳观察是高频路径：顺带按时间节流触发一次状态清理（O(1) 检查，实际 _prune
-        # 最快每 _PRUNE_MIN_INTERVAL_SECONDS 一次），避免"只主动戳、很少有人戳麦麦"的
-        # 环境下 _prune 长期不跑、_proactive_locks 等随群数累积。
-        plugin._state.maybe_prune()
-        group_id, speaker_id, stream_id = info
-        # 群级名单只依赖 group_id（O(1) set 查找），前移到派发前：名单外的群直接 return，
-        # 不必 spawn 一个进 _maybe_poke 立刻退出的空任务、白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。
-        # 黑名单优先；白名单非空时只放行名单内的群。
+        group_id, speaker_id, stream_id, trigger = info
+        # 群级名单、概率骰子、活跃时段都不依赖历史消息，放在派发前：注定出不了手的消息直接
+        # return，不必 spawn 空任务白占 PROACTIVE_TASK_QUEUE_LIMIT 槽位。黑名单优先；白名单
+        # 非空时只放行名单内的群；localtime 有开销，放在概率命中之后。
         if group_id in plugin._proactive_blacklist_groups:
             return
         if plugin._proactive_whitelist_groups and group_id not in plugin._proactive_whitelist_groups:
             return
-        # 概率骰子提前到派发前：未中签的群消息直接 return，避免占用队列槽位空跑 _maybe_poke。
-        if cfg.probability <= 0:
+        if cfg.probability <= 0 or random.random() > cfg.probability:
             return
-        if random.random() > cfg.probability:
-            return
-        # 活跃时段判定带 localtime 开销，放在概率命中之后、仅对入选消息计算（同样前移以免空跑任务）。
-        now_struct = time.localtime()
-        if not in_active_hours(cfg.active_hour_start, cfg.active_hour_end, now_struct.tm_hour):
+        if not in_active_hours(cfg.active_hour_start, cfg.active_hour_end, time.localtime().tm_hour):
             return
         plugin._spawn_background_task(
-            self._maybe_poke(group_id, speaker_id, stream_id), "proactive"
+            self._maybe_poke(group_id, speaker_id, stream_id, trigger), "proactive"
         )
 
     # ===== 候选信号提取 =====
 
-    def _extract_signal(self, message: Any) -> tuple[str, str, str] | None:
+    def _extract_signal(self, message: Any) -> tuple[str, str, str, dict[str, Any]] | None:
         """快速排除：仅做廉价过滤，重活留给 ``_maybe_poke``。
 
-        返回 ``(group_id, speaker_id, stream_id)``；``stream_id`` 取消息自带的 session_id
+        返回 ``(group_id, speaker_id, stream_id, trigger)``；``stream_id`` 取消息自带的 session_id
         （Host 派发 Hook 前已按路由身份算好回填），后续直接用它拉历史 / 写上下文，
         省掉一次反查 RPC，多账号同群时也不会串到别的账号的流。
 
-        顺便从 napcat codec 注入的 ``additional_config.self_id`` 学习当前 bot 账号——
+        ``trigger`` 是这条消息按 ``message.get_recent`` 同构格式精简出的记录（只留
+        message_id / timestamp / 发言人），交给 ``_maybe_poke`` 补进拉到的历史：Host 要到 Hook
+        之后才把入站消息写库，后台任务拉历史时多半还查不到它。只拷这几个字段，免得把
+        带图片 base64 的整条消息挂在后台任务上。
+
+        顺便从适配器写入的 ``additional_config.self_id`` 学习当前 bot 账号——
         普通消息也会带，比等 notify.poke 提前得多。
         """
         if not isinstance(message, dict):
@@ -119,9 +107,30 @@ class ProactivePoker:
             return None
 
         stream_id = str(message.get("session_id") or "").strip()
-        return group_id, speaker_id, stream_id
+        trigger = {
+            "message_id": str(message.get("message_id") or "").strip(),
+            "timestamp": message.get("timestamp"),
+            "message_info": {
+                "user_info": {
+                    "user_id": speaker_id,
+                    "user_cardname": user_info.get("user_cardname"),
+                    "user_nickname": user_info.get("user_nickname"),
+                },
+            },
+        }
+        return group_id, speaker_id, stream_id, trigger
 
     # ===== 主流程 =====
+
+    def _quota_available(self, group_id: str) -> bool:
+        """全局冷却（含 in-flight 预占与失败退避）、同群冷却、每日上限是否都允许出手。"""
+        cfg = self._plugin.config.proactive
+        state = self._plugin._state
+        if state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
+            return False
+        if state.in_proactive_chat_cooldown(group_id, cfg.per_chat_cooldown_seconds):
+            return False
+        return not (cfg.max_pokes_per_day > 0 and state.proactive_daily_count() >= cfg.max_pokes_per_day)
 
     def _still_allowed(self, group_id: str, target_id: str) -> bool:
         """思考延迟后、出手前复查最新配置：主动戳被关闭、群被拉黑 / 移出白名单、目标被拉黑则放弃。
@@ -147,94 +156,71 @@ class ProactivePoker:
         )
         return False
 
-    async def _maybe_poke(self, group_id: str, speaker_id: str, stream_id: str = "") -> None:
-        """主动戳的完整判定与执行流程。
-
-        双层锁：per-group lock 防同群双发，global lock 保护"全局冷却二次确认 + mark"
-        临界区——不同群的并发任务可能在各自 per-group lock 内同时穿过全局乐观快检。
-        RPC 与延迟都在 per-group lock 内或锁外，避免全局串行所有群的网络往返。
-        """
+    async def _maybe_poke(
+        self,
+        group_id: str,
+        speaker_id: str,
+        stream_id: str = "",
+        trigger: dict[str, Any] | None = None,
+    ) -> None:
+        """主动戳的完整判定与执行流程（并发控制见模块说明）。"""
         plugin = self._plugin
         cfg = plugin.config.proactive
+        state = plugin._state
 
-        # 概率骰子、群黑/白名单、活跃时段判定都已在 observe_signal 派发前完成
-        # （三者均只依赖 group_id，前移可避免为注定 return 的触发 spawn 出空任务），这里不再重复。
+        if not self._quota_available(group_id):
+            return
 
-        target_id: str = ""
-        target_name: str = ""
-        # begin_proactive_inflight 发的令牌；仅在锁内成功 begin 后才会走到锁外 try，
-        # 届时必为有效值(>0)，此处初始化只为静态可读性与防御。
-        inflight_token: int = 0
-
-        async with plugin._state.get_proactive_lock(group_id):
-            # 全局冷却是乐观快检，原子性靠后续 _proactive_global_lock 内的二次确认保障
-            if plugin._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
-                return
-            if plugin._state.in_proactive_chat_cooldown(group_id, cfg.per_chat_cooldown_seconds):
-                return
-            if cfg.max_pokes_per_day > 0:
-                already = plugin._state.proactive_daily_count()
-                if already >= cfg.max_pokes_per_day:
-                    return
-
-            # 优先用触发消息自带的 session_id；为空（异常适配器）才只读反查兜底
-            if not stream_id:
-                stream_id = await plugin.resolve_stream_id_for_group(group_id)
-            if not stream_id:
-                plugin.ctx.logger.debug(
-                    "[proactive] 群 %s 无法解析 stream_id，本次跳过", group_id,
-                )
-                return
-
-            try:
-                recent = await plugin.ctx.message.get_recent(
-                    stream_id, limit=cfg.recent_fetch_limit
-                )
-            except Exception:
-                plugin.ctx.logger.debug(
-                    "[proactive] message.get_recent 失败 (group=%s)", group_id, exc_info=True
-                )
-                return
-            if not isinstance(recent, list) or not recent:
-                return
-
-            target_id, target_name, active_count = self._pick_target(
-                recent, group_id, speaker_id,
+        # 优先用触发消息自带的 session_id；为空（异常适配器）才只读反查兜底
+        if not stream_id:
+            stream_id = await plugin.resolve_stream_id_for_group(group_id)
+        if not stream_id:
+            plugin.ctx.logger.debug(
+                "[proactive] 群 %s 无法解析 stream_id，本次跳过", group_id,
             )
-            if active_count < cfg.min_recent_messages:
-                return
-            if not target_id:
-                return
-            # 兜底防自戳：_pick_target 已用 known_self_id 过滤 bot 自己的消息，但
-            # self_id 学到之前的极端窗口里 bot 自己仍可能成为候选；这里在消耗
-            # 冷却/日上限（mark_proactive）之前再挡一道，避免戳到自己后触发
-            # ignore_self_poke 回声、白白浪费一次主动戳配额。
-            known_self_id = plugin._state.get_known_self_id()
-            if known_self_id and target_id == known_self_id:
-                plugin.ctx.logger.debug(
-                    "[proactive] 目标解析为 bot 自身 (self_id=%s)，跳过本次主动戳",
-                    known_self_id,
-                )
-                return
+            return
 
-            async with plugin._proactive_global_lock:
-                if plugin._state.in_proactive_global_cooldown(cfg.global_cooldown_seconds):
-                    return
-                if cfg.max_pokes_per_day > 0:
-                    already = plugin._state.proactive_daily_count()
-                    if already >= cfg.max_pokes_per_day:
-                        return
-                # 锁内只预占 in-flight 防并发双发；每日额度与群/全局长冷却推迟到
-                # send_poke 成功后再由 commit_proactive 计入，避免风控/超时/取消时
-                # "没戳出去却扣了配额"。in-flight 期间其他群的并发任务会在此退避。
-                # 传思考延迟的实际上界做动态 TTL，并接住令牌供 commit/abort 防误清。
-                # 锁外抽样用 hi = max(lo, max_delay)：误配 min > max 时实际延迟可达 min，
-                # 若只传 max_delay，in-flight 会在思考延迟结束前过期、放其他群穿过全局冷却。
-                inflight_token = plugin._state.begin_proactive_inflight(
-                    max(cfg.min_delay_seconds, cfg.max_delay_seconds)
-                )
+        try:
+            recent = await plugin.ctx.message.get_recent(
+                stream_id, limit=cfg.recent_fetch_limit
+            )
+        except Exception:
+            plugin.ctx.logger.debug(
+                "[proactive] message.get_recent 失败 (group=%s)", group_id, exc_info=True
+            )
+            return
+        if not isinstance(recent, list):
+            return
+        if trigger:
+            recent = self._with_trigger(recent, trigger)
+        if not recent:
+            return
 
-        # ----- 锁外：思考延迟 + 出手 -----
+        target_id, target_name, active_count = self._pick_target(
+            recent, group_id, speaker_id,
+        )
+        if active_count < cfg.min_recent_messages or not target_id:
+            return
+        # 兜底防自戳：_pick_target 已用 known_self_id 过滤 bot 自己的消息，但 self_id 学到之前的
+        # 极端窗口里 bot 自己仍可能成为候选；戳到自己只会触发回声，白白浪费一次配额。
+        known_self_id = state.get_known_self_id()
+        if known_self_id and target_id == known_self_id:
+            plugin.ctx.logger.debug(
+                "[proactive] 目标解析为 bot 自身 (self_id=%s)，跳过本次主动戳",
+                known_self_id,
+            )
+            return
+
+        # 上面的 await 期间别的任务可能已经出手：复检通过后立即预占 in-flight，两步之间不能有 await。
+        if not self._quota_available(group_id):
+            return
+        # 只预占 in-flight，每日额度与群/全局长冷却等 send_poke 成功后再由 commit_proactive 计入，
+        # 避免风控/超时/取消时"没戳出去却扣了配额"。TTL 按思考延迟的实际上界算（误配 min > max 时
+        # 实际延迟可达 min），令牌供 commit/abort 校验，防止误清后来者的 in-flight。
+        inflight_token = state.begin_proactive_inflight(
+            max(cfg.min_delay_seconds, cfg.max_delay_seconds)
+        )
+
         committed = False
         try:
             lo = max(0.0, cfg.min_delay_seconds)
@@ -258,13 +244,12 @@ class ProactivePoker:
             )
             if ok:
                 # 发送成功，正式占用每日额度与群/全局长冷却（令牌匹配时顺带清 in-flight）
-                plugin._state.commit_proactive(group_id, inflight_token)
+                state.commit_proactive(group_id, inflight_token)
                 committed = True
                 plugin.ctx.logger.info(
                     "[smart_poke] 主动戳完成: strategy=%s, group=%s, target=%s",
                     cfg.target_strategy, group_id, target_name or target_id,
                 )
-                # 复用触发消息自带 / _maybe_poke 里已解析的 stream_id，省一次缓存查
                 await plugin.record_self_poke_to_context(
                     label="proactive",
                     target_id=target_id,
@@ -276,9 +261,25 @@ class ProactivePoker:
         finally:
             if not committed:
                 # 失败/异常/取消：释放 in-flight 并留一小段全局失败退避，不消耗每日额度
-                plugin._state.abort_proactive_inflight(inflight_token)
+                state.abort_proactive_inflight(inflight_token)
 
     # ===== 目标挑选 =====
+
+    @staticmethod
+    def _with_trigger(recent: list[Any], trigger: dict[str, Any]) -> list[Any]:
+        """把触发消息补进 ``get_recent`` 的结果；按 message_id 判定已在库里就不重复加。
+
+        Host 要到 before_process Hook 之后才把入站消息写库，后台任务拉历史时触发消息多半
+        还查不到：不补的话 active_speaker 挑不中刚说话的人（会退到窗口里别的说话者），
+        群活跃计数也少算这一条。message_id 为空时无从判重，照样补上。
+        """
+        trigger_id = trigger.get("message_id")
+        if trigger_id and any(
+            isinstance(msg, dict) and str(msg.get("message_id") or "").strip() == trigger_id
+            for msg in recent
+        ):
+            return recent
+        return [*recent, trigger]
 
     def _pick_target(
         self,

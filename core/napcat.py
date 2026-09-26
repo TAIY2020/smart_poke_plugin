@@ -72,16 +72,13 @@ class NapcatPokeClient:
                 self._log_failure(label, "send_poke 无响应 (resp=None)")
                 return False
             if isinstance(resp, dict):
-                # 失败路径一：NapCat 业务失败由 adapter raise → Host _cap_api_call 包装为
-                # success=False，错误信息含 adapter 抛出的 "NapCat 动作返回失败: ..."。
+                # 失败路径一：适配器业务失败时抛异常，Host 包装成 success=False 的失败信封。
                 if resp.get("success") is False:
                     self._log_failure(label, f"宿主调用失败: {resp.get('error')}")
                     return False
-                # 失败路径二：部分 NapCat 兼容适配器（如 SnowLuma）业务失败时不抛异常，
-                # 而是原样返回 OneBot 响应（status!="ok" 或 retcode 非成功码）。这类响应
-                # 没有 success 键、过不了上面的判断，需按 OneBot 语义二次识别，避免把失败
-                # 误判成功、跳过回退（如回戳失败应补发文字）。NapCat 成功响应 status=="ok"、
-                # retcode 0/1（OneBot 成功码）不受影响。
+                # 失败路径二：旧版 SnowLuma 适配器（< 1.0.0）业务失败时不抛异常，原样返回
+                # status!="ok" 或 retcode 非成功码的 OneBot 响应，需按 OneBot 语义二次识别，
+                # 否则回戳失败会被当成成功、跳过文字兜底。成功响应 status=="ok"、retcode 为 0/1。
                 status = str(resp.get("status") or "").strip().lower()
                 if status and status != "ok":
                     self._log_failure(label, f"适配器返回失败状态 status={status}")
