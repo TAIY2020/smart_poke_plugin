@@ -656,7 +656,8 @@ class SmartPokePlugin(MaiBotPlugin):
         description="响应戳一戳通知，并观察普通群消息按概率触发主动戳",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
-        timeout_ms=3000,
+        # 3000 在宿主事件循环偶发卡顿时容易误判超时，钩子被 SKIP 掉就完全没机会回戳；放宽到 8000。
+        timeout_ms=8000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_poke_event(self, message: dict | None = None, **kwargs):
