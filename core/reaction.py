@@ -547,23 +547,70 @@ class ReactionExecutor:
     async def _resolve_persona(self) -> str:
         """解析 LLM 人设：插件显式配置 > 麦麦全局人设 > 兜底。
 
-        留空 ``llm_persona`` 时自动读 Host 全局 ``personality.personality``——
-        ``ctx.config.get`` 在本 Host 实为读宿主全局配置（见 _cap_config_get，
-        ``_get_nested_config_value(global_config, key)``），而非插件自身 config，
-        故能直接拿到麦麦人设，让戳一戳与主聊天语气一致；读取失败再回落到与 Host
-        默认一致的兜底人设。
+        留空 ``llm_persona`` 时按 Host Replyer 的口径拼装："你的名字是X" + 人格 + 表达风格：
+
+        * 人格与表达风格优先走 ``ctx.personality.get_current()``（SDK ≥ 2.20 / 支持
+          ``personality.*`` 的 Host），能拿到 ``reply_style`` 与备用风格，且人设经 WebUI
+          或其他插件切换后立即生效（故不缓存）；
+        * 取不到（旧 SDK 无 ``ctx.personality`` / 旧 Host 无该能力）时回退读
+          ``personality.personality``——``ctx.config.get`` 在本 Host 实为读宿主全局配置；
+        * 名字经 ``ctx.config.get("bot.nickname")`` 读取，与 Replyer 一致地放在开头。
+
+        各步失败一律降级，全部落空才用与 Host 默认一致的兜底人设。群聊 / 私聊提示词是为
+        "读聊天记录再回复"写的长段说明，与一句话回戳无关，刻意不注入。
         """
         configured = self._plugin.config.reaction.llm_persona.strip()
         if configured:
             return configured
+        ctx = self._plugin.ctx
+
+        personality = ""
+        reply_style = ""
         try:
-            global_persona = await self._plugin.ctx.config.get("personality.personality", "")
+            profile = await ctx.personality.get_current()
         except Exception:
-            self._plugin.ctx.logger.debug("[llm] 读取全局人设失败，使用兜底人设", exc_info=True)
-            global_persona = ""
-        if isinstance(global_persona, str) and global_persona.strip():
-            return global_persona.strip()
-        return _DEFAULT_LLM_PERSONA
+            ctx.logger.debug("[llm] personality.get_current 不可用，回退读全局配置", exc_info=True)
+            profile = None
+        if isinstance(profile, dict):
+            personality = str(profile.get("personality") or "").strip()
+            reply_style = self._pick_reply_style(profile)
+        if not personality:
+            try:
+                value = await ctx.config.get("personality.personality", "")
+            except Exception:
+                ctx.logger.debug("[llm] 读取全局人设失败", exc_info=True)
+                value = ""
+            if isinstance(value, str):
+                personality = value.strip()
+        if not personality:
+            return _DEFAULT_LLM_PERSONA
+
+        try:
+            nickname = await ctx.config.get("bot.nickname", "")
+        except Exception:
+            ctx.logger.debug("[llm] 读取 bot 昵称失败", exc_info=True)
+            nickname = ""
+        nickname = nickname.strip() if isinstance(nickname, str) else ""
+
+        parts = [f"你的名字是{nickname}。" if nickname else "", personality]
+        if reply_style:
+            parts.append(f"你说话的风格：{reply_style}")
+        return "\n".join(p for p in parts if p)
+
+    @staticmethod
+    def _pick_reply_style(profile: dict[str, Any]) -> str:
+        """取表达风格：按 ``multiple_probability`` 概率改用一条备用风格，口径同 Host。"""
+        style = str(profile.get("reply_style") or "").strip()
+        alternates = [
+            str(s).strip() for s in profile.get("multiple_reply_style") or [] if str(s).strip()
+        ]
+        try:
+            probability = float(profile.get("multiple_probability") or 0)
+        except (TypeError, ValueError):
+            probability = 0.0
+        if alternates and random.random() < probability:
+            return random.choice(alternates)
+        return style
 
     def _build_llm_prompt(
         self, ctx: PokeContext, is_spam: bool, persona: str, context_text: str = ""

@@ -373,7 +373,7 @@ class ReactionSection(PluginConfigBase):
         default="",
         description=(
             "LLM 反应档的人设 / 说话风格描述，作为 system 提示注入。"
-            "留空时自动读取麦麦的全局人设（personality.personality），与主聊天保持一致；"
+            "留空时自动读取麦麦的全局人设（名字 + 人格 + 表达风格，人设切换后即时生效），与主聊天保持一致；"
             "填写则覆盖，可给戳一戳单独定制更冲 / 更皮的语气。一两句话点明性格即可"
         ),
         json_schema_extra={

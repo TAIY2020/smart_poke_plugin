@@ -15,7 +15,7 @@ import random
 import time
 from typing import TYPE_CHECKING, Any
 
-from .common import in_active_hours, to_positive_int
+from .common import extract_message_route_components, in_active_hours, to_positive_int
 
 
 if TYPE_CHECKING:
@@ -69,7 +69,7 @@ class ProactivePoker:
         之后才把入站消息写库，后台任务拉历史时多半还查不到它。只拷这几个字段，免得把
         带图片 base64 的整条消息挂在后台任务上。
 
-        顺便从适配器写入的 ``additional_config.self_id`` 学习当前 bot 账号——
+        顺便从消息的路由身份（顶层 ``account_id``，回退 ``additional_config``）学习当前 bot 账号——
         普通消息也会带，比等 notify.poke 提前得多。
         """
         if not isinstance(message, dict):
@@ -81,10 +81,12 @@ class ProactivePoker:
         if not isinstance(msg_info, dict):
             return None
 
-        additional = msg_info.get("additional_config") or {}
-        if isinstance(additional, dict):
-            learned_self_id = str(additional.get("self_id") or "").strip()
-            self._plugin._state.set_known_self_id(learned_self_id)
+        # 路由身份的账号分量即 bot 自己的 QQ 号：SnowLuma ≥ 1.1.5 只写消息顶层 account_id、
+        # 不再写 additional_config.self_id，按 Host 口径顶层优先、additional_config 兼容回退。
+        learned_self_id, _scope = extract_message_route_components(
+            message, msg_info.get("additional_config")
+        )
+        self._plugin._state.set_known_self_id(learned_self_id)
 
         group_info = msg_info.get("group_info") or {}
         if not isinstance(group_info, dict):
