@@ -656,7 +656,8 @@ class SmartPokePlugin(MaiBotPlugin):
         description="响应戳一戳通知，并观察普通群消息按概率触发主动戳",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
-        # 3000 在宿主事件循环偶发卡顿时容易误判超时，钩子被 SKIP 掉就完全没机会回戳；放宽到 8000。
+        # 钩子体是纯同步判定，超时只会来自宿主/Runner 调度卡顿。超时后 Host 丢弃本次 abort（戳通知漏进主链），
+        # 且计入插件级熔断：连续 3 次即熔断 60s 起，期间整个钩子被跳过、不再回戳，故放宽到 8000 给足余量。
         timeout_ms=8000,
         error_policy=ErrorPolicy.SKIP,
     )
