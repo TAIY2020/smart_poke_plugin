@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -137,6 +138,79 @@ def in_active_hours(start: int, end: int, now_hour: int) -> bool:
     if start < end_normalized:
         return start <= now_hour < end_normalized
     return now_hour >= start or now_hour < end_normalized
+
+
+# 静音时段写法：``HH:MM-HH:MM``。容忍全角冒号与常见的连接符（- – — ~ ～ 至 到）。
+_QUIET_PERIOD_PATTERN = re.compile(
+    r"^\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*[-–—~～至到]\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$"
+)
+_MINUTES_PER_DAY = 24 * 60
+
+
+def _to_minute_of_day(hour: int, minute: int) -> int | None:
+    """``HH:MM`` 转为当天第几分钟；``24:00`` 返回 1440，越界返回 ``None``。"""
+    if minute > 59:
+        return None
+    if hour == 24:
+        return _MINUTES_PER_DAY if minute == 0 else None
+    if hour > 23:
+        return None
+    return hour * 60 + minute
+
+
+def parse_quiet_period(value: Any) -> tuple[int, int] | None:
+    """把一条 ``HH:MM-HH:MM`` 解析成 ``(start, end)`` 分钟数；写法非法返回 ``None``。
+
+    起点的 ``24:00`` 视同 ``00:00``；终点的 ``24:00`` 保留为 1440（``00:00-24:00`` 即全天）。
+    起止相同（如 ``08:00-08:00``）不构成时段，同样返回 ``None``——全天不响应应关掉
+    群聊 / 私聊响应开关，而不是靠一条容易误配的"零长度"时段。
+    """
+    match = _QUIET_PERIOD_PATTERN.match(str(value or ""))
+    if match is None:
+        return None
+    start_hour, start_minute, end_hour, end_minute = (int(part) for part in match.groups())
+    start = _to_minute_of_day(start_hour, start_minute)
+    end = _to_minute_of_day(end_hour, end_minute)
+    if start is None or end is None:
+        return None
+    start %= _MINUTES_PER_DAY
+    if start == end:
+        return None
+    return start, end
+
+
+def format_quiet_period(period: tuple[int, int]) -> str:
+    """把 ``(start, end)`` 分钟数格式化回规范写法 ``HH:MM-HH:MM``。"""
+    start, end = period
+    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+
+
+def parse_quiet_periods(values: Any) -> tuple[tuple[int, int], ...]:
+    """批量解析静音时段，跳过非法项（配置校验器已归一化，这里只是防御）。"""
+    if not isinstance(values, (list, tuple)):
+        return ()
+    periods = (parse_quiet_period(value) for value in values)
+    return tuple(period for period in periods if period is not None)
+
+
+def in_quiet_periods(periods: tuple[tuple[int, int], ...], now_minute: int) -> bool:
+    """判断当天第 ``now_minute`` 分钟是否落在任一静音时段 [start, end) 内（本地时间）。
+
+    ``start > end`` 为跨午夜时段（如 23:30-07:00）；终点不含，07:00 整即恢复。
+    """
+    for start, end in periods:
+        if start < end:
+            if start <= now_minute < end:
+                return True
+        elif now_minute >= start or now_minute < end:
+            return True
+    return False
+
+
+def local_minute_of_day() -> int:
+    """宿主本地时间的当天第几分钟，与 active_hour_* 同口径。"""
+    now = time.localtime()
+    return now.tm_hour * 60 + now.tm_min
 
 
 def format_local_date(timestamp: float) -> str:

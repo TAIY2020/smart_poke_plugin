@@ -240,12 +240,26 @@ class ReactionExecutor:
             reason = "群聊响应已关闭"
         elif not ctx.is_group and not cfg.react_in_private:
             reason = "私聊响应已关闭"
+        elif plugin.in_quiet_period():
+            reason = "已进入静音时段"
         else:
             return True
         plugin.ctx.logger.debug(
             "[%s] 发送前复查未通过（%s），放弃本次反应 (poker=%s)", label, reason, ctx.poker_id,
         )
         return False
+
+    def _quiet_now(self, label: str) -> bool:
+        """发送动作落地前的静音时段闸门：命中时打 debug 并返回 ``True``，调用方放弃发送。
+
+        ``_reaction_still_allowed`` 只覆盖思考延迟之后的首次发送；发送失败后的级联回退
+        （表情失败→回戳→文字等）隔着若干次 RPC，可能跨进静音起点。闸门设在各发送动作
+        自身，回退链上的每一档在静音时段内都会落空，整条链自然安静收场。
+        """
+        if not self._plugin.in_quiet_period():
+            return False
+        self._plugin.ctx.logger.debug("[%s] 已进入静音时段，放弃发送", label)
+        return True
 
     def _superseded(
         self, ctx: PokeContext, react_token: float | None, label: str
@@ -325,6 +339,8 @@ class ReactionExecutor:
 
         any_success = False
         for i in range(times):
+            if self._quiet_now("back_poke"):
+                break
             # 连戳之间有短延迟，期间用户可能被热更新拉黑：每一下发出前复查一次
             if i > 0 and ctx.poker_id in plugin._blacklist:
                 plugin.ctx.logger.debug(
@@ -396,6 +412,8 @@ class ReactionExecutor:
         return {}
 
     async def _safe_send_text(self, text: str, stream_id: str) -> bool:
+        if self._quiet_now("send_text"):
+            return False
         try:
             # ctx.send.text 在发送业务失败时返回 False（不抛异常），必须接住返回值，
             # 否则级联回退（文字失败→回退回戳）会因误判成功而失效。
@@ -410,6 +428,8 @@ class ReactionExecutor:
     async def _send_emoji(self, stream_id: str) -> bool:
         """发送一张表情包。Host 序列化表情时固定输出 ``base64`` 字段。"""
         plugin = self._plugin
+        if self._quiet_now("send_emoji"):
+            return False
         try:
             emoji = await plugin._emoji.pick_emoji()
             if not isinstance(emoji, dict):

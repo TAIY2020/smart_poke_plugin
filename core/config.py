@@ -12,12 +12,14 @@ from typing import Any, Literal
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator, model_validator
 
+from .common import format_quiet_period, parse_quiet_period
+
 
 _logger = logging.getLogger(__name__)
 
 
 # 配置 schema 版本（与插件版本独立，仅在配置字段结构变更时手动上调）
-CONFIG_SCHEMA_VERSION = "1.9.0"
+CONFIG_SCHEMA_VERSION = "1.10.0"
 
 
 # proactive.respect_spam_window_seconds 的有效上限：与 state.PokeStateManager._STALE_AFTER_SECONDS
@@ -320,6 +322,24 @@ class ReactionSection(PluginConfigBase):
         description="是否在私聊中响应戳一戳",
         json_schema_extra={"label": "私聊响应"},
     )
+    quiet_periods: list[str] = Field(
+        default_factory=list,
+        description=(
+            "每日静音时段列表（宿主本地时间，24h 制，格式 HH:MM-HH:MM，起点含、终点不含）。"
+            "时段内被戳一律不反应：不回戳，也不发文字 / 表情 / LLM 回复 / 沉默回复池；"
+            "群聊与私聊同时生效。支持多段与跨午夜，例如 23:30-07:00 加 12:30-13:30。"
+            "事件是否吞掉沿用 swallow_when_silent；只影响被戳反应，跟风戳与主动戳不受影响。"
+            "留空表示不静音"
+        ),
+        json_schema_extra={
+            "label": "静音时段",
+            "hint": (
+                "每项一段，如 23:30-07:00（可跨午夜）；时段内被戳不作任何反应。"
+                "要彻底安静需保持「沉默时吞事件」开启，否则事件会放行给主程序自带的回应"
+            ),
+            "placeholder": "23:30-07:00",
+        },
+    )
 
     # ----- LLM 反应档参数（仅当 LLM 回复权重 > 0 时生效）-----
 
@@ -428,6 +448,33 @@ class ReactionSection(PluginConfigBase):
                 value,
             )
         return "planner"
+
+    @field_validator("quiet_periods", mode="before")
+    @classmethod
+    def _normalize_quiet_periods(cls, value: Any) -> list[str]:
+        """归一化为规范写法 ``HH:MM-HH:MM`` 并去重；非法项丢弃并告警，不让整份配置加载失败。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        result: list[str] = []
+        for item in value:
+            if item is None or not str(item).strip():
+                continue
+            period = parse_quiet_period(item)
+            if period is None:
+                _logger.warning(
+                    "reaction.quiet_periods 中的 %r 不是合法时段，已忽略。"
+                    "格式为 HH:MM-HH:MM（如 23:30-07:00），且起止时间不能相同",
+                    item,
+                )
+                continue
+            text = format_quiet_period(period)
+            if text not in result:
+                result.append(text)
+        return result
 
     @model_validator(mode="after")
     def _check_delay_range(self) -> "ReactionSection":

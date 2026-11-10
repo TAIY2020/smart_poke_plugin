@@ -35,6 +35,9 @@ from .core.common import (
     PROACTIVE_TASK_QUEUE_LIMIT,
     extract_message_route_components,
     extract_onebot_field,
+    in_quiet_periods,
+    local_minute_of_day,
+    parse_quiet_periods,
     to_positive_int,
 )
 from .core.config import SmartPokeConfig
@@ -71,6 +74,8 @@ class SmartPokePlugin(MaiBotPlugin):
         self._proactive_blacklist_groups: set[str] = set()
         self._bystander_whitelist_groups: set[str] = set()
         self._bystander_blacklist_groups: set[str] = set()
+        # 被戳反应的每日静音时段，(start, end) 为当天第几分钟。
+        self._quiet_periods: tuple[tuple[int, int], ...] = ()
         self._pending_tasks: set[asyncio.Task] = set()
         # emoji 关键词探测任务句柄：热更新时取消上一轮未结束的探测，避免累积并发长轮询。
         self._emoji_probe_task: asyncio.Task | None = None
@@ -234,6 +239,13 @@ class SmartPokePlugin(MaiBotPlugin):
         self._proactive_blacklist_groups = set(cfg.proactive.blacklist_groups)
         self._bystander_whitelist_groups = set(cfg.bystander.whitelist_groups)
         self._bystander_blacklist_groups = set(cfg.bystander.blacklist_groups)
+        self._quiet_periods = parse_quiet_periods(cfg.reaction.quiet_periods)
+
+    def in_quiet_period(self) -> bool:
+        """当前（宿主本地时间）是否处于被戳反应的静音时段；未配置时段时恒为 ``False``。"""
+        if not self._quiet_periods:
+            return False
+        return in_quiet_periods(self._quiet_periods, local_minute_of_day())
 
     def _sync_state_retention(self) -> None:
         """把主动戳冷却配置同步给状态层作为其时间戳的保留期，防长冷却被 1 小时 stale 阈值提前清掉。"""
@@ -716,6 +728,17 @@ class SmartPokePlugin(MaiBotPlugin):
             self.config.reaction.spam_window_seconds,
         )
         is_spam = poke_count >= self.config.reaction.spam_threshold
+
+        # 静音时段：不作任何反应（也不走沉默回复池），不消耗冷却与每分钟窗口。
+        # 放在暴戳计数之后——这次戳照样记入，主动戳的「避开戳过麦麦的人」仍能命中。
+        if self.in_quiet_period():
+            self.ctx.logger.debug(
+                "[%s] 处于静音时段，不反应 (poker=%s)",
+                ctx.cooldown_key or ctx.poker_id, ctx.poker_id,
+            )
+            if self.config.reaction.swallow_when_silent:
+                return {"action": "abort"}
+            return None
 
         if self._state.in_cooldown(
             ctx.cooldown_key, ctx.poker_id, self.config.reaction.cooldown_seconds
